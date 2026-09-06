@@ -12,7 +12,7 @@ export const runtime = "nodejs";
 export async function GET() {
   try {
     const user = await requireSession();
-    const data = await getHubSpotStatus(user.companyId, user.id);
+    const data = await getHubSpotStatus(user.companyId);
     return Response.json({ data });
   } catch (error) {
     return jsonError(error, "Unable to load HubSpot status", 500);

@@ -98,6 +98,8 @@ export function LeadAiEmailPanel({ leadId, leadEmail, emailOptOut }: Props) {
 
   useEffect(() => {
     void load();
+    // Intentionally only re-fetch when lead changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leadId]);
 
   async function generate() {

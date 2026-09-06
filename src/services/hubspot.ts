@@ -84,7 +84,7 @@ export async function exchangeHubSpotCode(code: string) {
   };
 }
 
-export async function getHubSpotStatus(companyId: string, _userId?: string) {
+export async function getHubSpotStatus(companyId: string) {
   const conn = await prisma.crmConnection.findUnique({
     where: {
       companyId_provider: { companyId, provider: CrmProvider.HUBSPOT },

@@ -1,6 +1,5 @@
 import { requireSession } from "@/lib/session";
 import { getAppUrl } from "@/lib/app-url";
-import { jsonError, AppError } from "@/lib/errors";
 import { prisma } from "@/lib/prisma";
 import { verifySignedState } from "@/lib/calendar/google-oauth-state";
 import { exchangeGmailCode } from "@/lib/email/gmail-client";

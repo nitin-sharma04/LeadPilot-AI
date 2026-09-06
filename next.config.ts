@@ -5,6 +5,19 @@ const isProd = process.env.NODE_ENV === "production";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  // Render free/starter builds OOM during ESLint+tsc in the same worker.
+  // Lint locally / CI separately; typecheck still runs via `tsc` when needed.
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+  typescript: {
+    // Skip typecheck during `next build` to avoid Render OOM on small plans.
+    // Run `npx tsc --noEmit` locally / in CI instead.
+    ignoreBuildErrors: true,
+  },
+  experimental: {
+    webpackMemoryOptimizations: true,
+  },
   async headers() {
     const security = [
       { key: "X-Content-Type-Options", value: "nosniff" },

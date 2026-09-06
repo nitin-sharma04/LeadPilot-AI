@@ -3,23 +3,37 @@ services:
     name: leadpilot-web
     runtime: node
     plan: starter
-    buildCommand: npm ci && npx prisma generate && npm run build
+    # Use Node 20 LTS (less memory than Node 24 default on Render)
+    envVarGroups: []
+    buildCommand: npm ci && NODE_OPTIONS=--max-old-space-size=2048 npm run build
     startCommand: npx prisma migrate deploy && npm start
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "20.19.0"
+      # Set these in the Render dashboard (Supabase URL, secrets). Do not commit secrets.
       - key: DATABASE_URL
-        fromDatabase:
-          name: leadpilot-db
-          property: connectionString
+        sync: false
       - key: AUTH_SECRET
-        generateValue: true
+        sync: false
       - key: APP_URL
         sync: false
       - key: AUTH_URL
         sync: false
-      # Add remaining secrets in the Render dashboard — never commit values here
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: DEMO_MODE
+        value: "false"
 
   - type: web
     name: leadpilot-voice
@@ -31,16 +45,9 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "20.19.0"
       - key: DATABASE_URL
-        fromDatabase:
-          name: leadpilot-db
-          property: connectionString
+        sync: false
       - key: PORT
         value: "10000"
-      # VOICE_STREAM_URL / GEMINI / TWILIO set in dashboard
-
-databases:
-  - name: leadpilot-db
-    plan: basic-256mb
-    databaseName: leadpilot
-    user: leadpilot

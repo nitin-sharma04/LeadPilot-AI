@@ -6,9 +6,7 @@ import { prisma } from "@/lib/prisma";
 import {
   enrollLeadInSequence,
   ensureDefaultSequence,
-  stopEnrollment,
 } from "@/services/follow-up-sequences";
-import { SequenceStopReason } from "@prisma/client";
 
 export const runtime = "nodejs";
 

@@ -4,8 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "prisma generate && node --max-old-space-size=2048 ./node_modules/next/dist/bin/next build",
     "start": "next start",
+    "postinstall": "prisma generate",
     "lint": "eslint src",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
@@ -19,10 +20,12 @@
     "voice:start": "npm --prefix voice-server run start",
     "voice:typecheck": "npm --prefix voice-server run typecheck"
   },
+  "engines": {
+    "node": ">=20 <23"
+  },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
-  },
-  "dependencies": {
+  },  "dependencies": {
     "@prisma/client": "6.19.3",
     "@radix-ui/react-avatar": "^1.2.6",
     "@radix-ui/react-dialog": "^1.1.23",

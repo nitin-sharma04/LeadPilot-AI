@@ -71,12 +71,25 @@ https://YOUR_DOMAIN/api/integrations/hubspot/callback
 
 1. Connect the GitHub repo  
 2. Runtime: Node  
-3. Build: `npm ci && npx prisma generate && npm run build`  
-4. Start: `npx prisma migrate deploy && npm start`  
-5. Health check: `/api/health`  
-6. Attach Postgres → `DATABASE_URL`  
-7. Set env vars in the dashboard  
+3. **Node version:** `20.19.0` (set `NODE_VERSION=20.19.0` or use `.nvmrc`)  
+4. Build: `npm ci && NODE_OPTIONS=--max-old-space-size=2048 npm run build`  
+5. Start: `npx prisma migrate deploy && npm start`  
+6. Health check: `/api/health`  
+7. **Environment (required):** paste from your local secrets — use **Supabase** `DATABASE_URL`, not a Render Postgres unless you intend to.
+
+| Key | Example |
+|-----|---------|
+| `DATABASE_URL` | Supabase direct Postgres URI |
+| `AUTH_SECRET` | random 32+ bytes |
+| `APP_URL` | `https://YOUR-SERVICE.onrender.com` |
+| `AUTH_URL` | same as `APP_URL` |
+| `GEMINI_API_KEY` | your key |
+| `TWILIO_*` | if using voice |
+| `DEMO_MODE` | `false` |
+
 8. Custom domain → update `APP_URL` / OAuth redirects / Twilio URLs  
+
+Signup/login create real `Company` + `User` rows in Supabase via Prisma (Auth.js + bcrypt). No demo seed required.
 
 Optional second service for `voice-server/`:
 

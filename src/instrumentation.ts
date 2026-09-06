@@ -5,6 +5,8 @@
 
 export async function register() {
   if (process.env.NEXT_RUNTIME === "edge") return;
+  // Skip during `next build` — env secrets may be absent at build time on Render
+  if (process.env.NEXT_PHASE === "phase-production-build") return;
 
   const { validateEnvironment } = await import("@/lib/env");
   const result = validateEnvironment();
