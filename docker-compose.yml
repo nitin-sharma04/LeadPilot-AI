@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: leadpilot
+      POSTGRES_PASSWORD: leadpilot
+      POSTGRES_DB: leadpilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - leadpilot_pg:/var/lib/postgresql/data
+
+volumes:
+  leadpilot_pg:

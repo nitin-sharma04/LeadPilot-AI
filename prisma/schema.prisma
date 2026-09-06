@@ -1,0 +1,868 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MANAGER
+  /// Product "MEMBER" role — assigned leads / day-to-day sales work
+  SALES_REP
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  MEETING
+  PROPOSAL
+  WON
+  LOST
+}
+
+enum LeadSource {
+  WEBSITE
+  GOOGLE_ADS
+  FACEBOOK
+  LINKEDIN
+  REFERRAL
+  MANUAL
+  API
+  WEB_FORM
+  CSV
+  HUBSPOT
+  SALESFORCE
+  META_ADS
+  OTHER
+}
+
+enum CallStatus {
+  INITIATING
+  RINGING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  NO_ANSWER
+  BUSY
+  CANCELED
+  /// Legacy demo statuses kept for seed compatibility
+  SCHEDULED
+  CONNECTED
+}
+
+enum CallDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum TranscriptSpeaker {
+  AI
+  LEAD
+}
+
+enum FollowUpStatus {
+  SCHEDULED
+  SENT
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum AppointmentSource {
+  MANUAL
+  AI_CALL
+  WEB
+}
+
+enum SalesResponseType {
+  INITIAL_OUTREACH
+  FOLLOW_UP
+  RE_ENGAGEMENT
+  MEETING_CONFIRMATION
+  PROPOSAL_FOLLOW_UP
+  GENERAL
+}
+
+enum SalesResponseTone {
+  PROFESSIONAL
+  FRIENDLY
+  CONSULTATIVE
+  DIRECT
+  PREMIUM
+}
+
+enum SalesResponseChannel {
+  EMAIL
+  MESSAGE
+}
+
+model Company {
+  id          String   @id @default(cuid())
+  name        String
+  industry    String?
+  website     String?
+  description String?
+  /// IANA timezone for scheduling defaults (e.g. Asia/Kolkata)
+  timezone    String   @default("UTC")
+  /// Phase 7 email automation (defaults conservative / human approval)
+  emailAutomationEnabled           Boolean @default(false)
+  emailAutoSendEnabled             Boolean @default(false)
+  emailAppointmentConfirmEnabled   Boolean @default(false)
+  emailFollowUpSequencesEnabled    Boolean @default(false)
+  emailPostCallEnabled             Boolean @default(false)
+  /// When true, AI prepares drafts; user must approve before send
+  emailHumanApprovalRequired       Boolean @default(true)
+  defaultEmailAccountId            String?
+  /// Phase 8 lead capture automation (safe defaults)
+  leadAutoAnalyzeEnabled           Boolean @default(true)
+  leadAutoAssignEnabled            Boolean @default(false)
+  leadAutoFollowUpEnabled          Boolean @default(false)
+  leadAutoCallEnabled              Boolean @default(false)
+  leadAutoEmailEnabled             Boolean @default(false)
+  defaultLeadOwnerId               String?
+  defaultFollowUpSequenceId        String?
+  /// True only for explicitly seeded demo workspaces (never for signup)
+  isDemo                           Boolean  @default(false)
+  /// Null until onboarding wizard is finished or skipped
+  onboardingCompletedAt            DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users                      User[]
+  leads                      Lead[]
+  calls                      Call[]
+  followUps                  FollowUp[]
+  appointments               Appointment[]
+  activities                 Activity[]
+  notifications              Notification[]
+  aiAgents                   AIAgent[]
+  generatedResponses         GeneratedResponse[]
+  googleCalendarConnections  GoogleCalendarConnection[]
+  emailAccounts              EmailAccount[]
+  emailMessages              EmailMessage[]
+  followUpSequences          FollowUpSequence[]
+  followUpEnrollments        FollowUpEnrollment[]
+  leadCaptureKeys            LeadCaptureKey[]
+  webhookEvents              WebhookEvent[]
+  leadImports                LeadImport[]
+  crmConnections             CrmConnection[]
+  leadExternalIdentities     LeadExternalIdentity[]
+  teamInvitations            TeamInvitation[]
+  passwordResetTokens        PasswordResetToken[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  image        String?
+  passwordHash String
+  role         UserRole @default(SALES_REP)
+  companyId    String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company      Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  assignedLeads Lead[]       @relation("LeadAssignee")
+  appointments Appointment[] @relation("AppointmentAssignee")
+  activities   Activity[]
+  notifications Notification[]
+  callsAsAgent Call[]        @relation("CallAgent")
+  generatedResponses GeneratedResponse[]
+  googleCalendarConnection GoogleCalendarConnection?
+  emailAccounts      EmailAccount[]
+  emailMessages      EmailMessage[]
+  leadCaptureKeysCreated LeadCaptureKey[]
+  teamInvitationsSent    TeamInvitation[] @relation("InvitationInviter")
+  passwordResetTokens    PasswordResetToken[]
+
+  @@index([companyId])
+}
+
+model Lead {
+  id           String     @id @default(cuid())
+  companyId    String
+  assignedToId String?
+  name         String
+  email        String
+  phone        String?
+  companyName  String     @map("company")
+  jobTitle     String?
+  industry     String?
+  source       LeadSource @default(MANUAL)
+  message      String?
+  budget       String?
+  timeline     String?
+  score        Int        @default(0)
+  intent       String?
+  urgency      String?
+  status       LeadStatus @default(NEW)
+  dealValue    Int        @default(0)
+  /// Phase 7: stop automated sales emails
+  emailOptOut  Boolean    @default(false)
+  emailOptOutAt DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  company      Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  assignedTo   User?           @relation("LeadAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  analysis     LeadAnalysis?
+  calls        Call[]
+  followUps    FollowUp[]
+  appointments Appointment[]
+  activities   Activity[]
+  generatedResponses GeneratedResponse[]
+  emailMessages      EmailMessage[]
+  followUpEnrollments FollowUpEnrollment[]
+  externalIdentities LeadExternalIdentity[]
+
+  @@index([companyId])
+  @@index([assignedToId])
+  @@index([status])
+  @@index([score])
+  @@index([createdAt])
+  @@index([emailOptOut])
+  @@index([email])
+}
+
+model LeadAnalysis {
+  id              String   @id @default(cuid())
+  leadId          String   @unique
+  score           Int
+  intent          String?
+  urgency         String?
+  estimatedBudget String?
+  industry        String?
+  buyingStage     String?
+  requirements    String[] @default([])
+  painPoints      String[] @default([])
+  objections      String[] @default([])
+  recommendation  String?
+  reasoning       String?
+  /// "seed" for demo data; live providers: "gemini" | "openai" | "experiential-labs"
+  source          String   @default("seed")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+}
+
+model GeneratedResponse {
+  id                   String               @id @default(cuid())
+  companyId            String
+  leadId               String
+  userId               String?
+  channel              SalesResponseChannel
+  responseType         SalesResponseType
+  tone                 SalesResponseTone
+  subject              String?
+  body                 String
+  callToAction         String
+  personalizationNotes String[]             @default([])
+  provider             String
+  model                String
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead    Lead    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([leadId])
+  @@index([createdAt])
+}
+
+model Call {
+  id                 String        @id @default(cuid())
+  companyId          String
+  leadId             String
+  agentId            String?
+  provider           String        @default("twilio")
+  providerCallId     String?
+  direction          CallDirection @default(OUTBOUND)
+  status             CallStatus    @default(INITIATING)
+  /// "realtime" | "turn_based"
+  voiceMode          String        @default("turn_based")
+  /// One-time token validating Twilio Media Stream WebSocket sessions
+  streamToken        String?
+  phoneNumber        String?
+  duration           Int?
+  outcome            String?
+  qualificationScore Int?
+  recordingUrl       String?
+  startedAt          DateTime?
+  answeredAt         DateTime?
+  endedAt            DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  company     Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead        Lead              @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  agent       User?             @relation("CallAgent", fields: [agentId], references: [id], onDelete: SetNull)
+  transcripts CallTranscript[]
+  summary     CallSummary?
+  appointments Appointment[]
+
+  @@index([companyId])
+  @@index([leadId])
+  @@index([providerCallId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model CallTranscript {
+  id        String            @id @default(cuid())
+  callId    String
+  speaker   TranscriptSpeaker
+  message   String
+  timestamp DateTime          @default(now())
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([callId])
+}
+
+model CallSummary {
+  id                   String    @id @default(cuid())
+  callId               String    @unique
+  intent               String?
+  budget               String?
+  timeline             String?
+  requirements         String?
+  objections           String?
+  nextAction           String?
+  summary              String
+  outcome              String?
+  interestLevel        String?
+  keyRequirements      String[]  @default([])
+  painPoints           String[]  @default([])
+  objectionList        String[]  @default([])
+  followUpRecommended  Boolean   @default(false)
+  /// none | proposed | confirmed | booked | declined | failed
+  appointmentStatus    String    @default("none")
+  preferredMeetingTime String?
+  appointmentDateTime  DateTime?
+  appointmentTimezone  String?
+  appointmentId        String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  call        Call         @relation(fields: [callId], references: [id], onDelete: Cascade)
+  appointment Appointment? @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+
+  @@index([appointmentId])
+}
+
+model AIAgent {
+  id                     String   @id @default(cuid())
+  companyId              String
+  name                   String
+  voice                  String
+  tone                   String
+  greeting               String
+  companyInformation     String
+  qualificationQuestions String[]
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model FollowUp {
+  id          String         @id @default(cuid())
+  companyId   String
+  leadId      String
+  sequenceDay Int
+  message     String
+  scheduledAt DateTime
+  status      FollowUpStatus @default(SCHEDULED)
+  createdAt   DateTime       @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead    Lead    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([leadId])
+  @@index([status])
+}
+
+model Appointment {
+  id              String            @id @default(cuid())
+  companyId       String
+  leadId          String
+  assignedToId    String?
+  callId          String?
+  title           String
+  description     String?
+  dateTime        DateTime
+  duration        Int               @default(30)
+  /// IANA timezone for display / scheduling context
+  timezone        String            @default("UTC")
+  status          AppointmentStatus @default(SCHEDULED)
+  source          AppointmentSource @default(MANUAL)
+  notes           String?
+  meetingUrl      String?
+  /// Google Calendar event id when synced
+  externalEventId String?
+  /// "google" when synced; null = LeadPilot-only
+  calendarProvider String?
+  /// Prevents duplicate AI/manual retries: unique per company when set
+  idempotencyKey  String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  company      Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead         Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  assignedTo   User?         @relation("AppointmentAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  call         Call?         @relation(fields: [callId], references: [id], onDelete: SetNull)
+  callSummaries CallSummary[]
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId])
+  @@index([leadId])
+  @@index([callId])
+  @@index([dateTime])
+  @@index([status])
+}
+
+model GoogleCalendarConnection {
+  id            String   @id @default(cuid())
+  companyId     String
+  userId        String   @unique
+  googleEmail   String
+  accessToken   String
+  refreshToken  String
+  expiryDate    DateTime
+  scope         String   @default("")
+  calendarId    String   @default("primary")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+}
+
+model Activity {
+  id          String   @id @default(cuid())
+  companyId   String
+  leadId      String?
+  userId      String?
+  type        String
+  description String
+  createdAt   DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead    Lead?   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([leadId])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  companyId String
+  userId    String
+  type      String
+  title     String
+  message   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([userId, read])
+}
+
+// ─── Phase 7: Email & Follow-up Automation ───────────────────────────────────
+
+enum EmailProvider {
+  GMAIL
+  DEMO
+}
+
+enum EmailAccountStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+  DEMO
+}
+
+enum EmailDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum EmailMessageStatus {
+  DRAFT
+  QUEUED
+  SENDING
+  SENT
+  FAILED
+  RECEIVED
+}
+
+enum EmailType {
+  INTRO
+  FOLLOW_UP
+  POST_CALL
+  APPOINTMENT_CONFIRMATION
+  APPOINTMENT_REMINDER
+  POST_MEETING
+  RE_ENGAGEMENT
+  CUSTOM
+}
+
+enum EmailTone {
+  PROFESSIONAL
+  FRIENDLY
+  CONCISE
+  CONSULTATIVE
+}
+
+enum SequenceEnrollmentStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  STOPPED
+  FAILED
+}
+
+enum SequenceStopReason {
+  REPLIED
+  BOOKED
+  CLOSED
+  MANUAL
+  UNSUBSCRIBED
+  FAILED
+  OPTED_OUT
+}
+
+model EmailAccount {
+  id           String             @id @default(cuid())
+  companyId    String
+  userId       String
+  provider     EmailProvider      @default(GMAIL)
+  emailAddress String
+  displayName  String?
+  /// Server-side only — never expose to client
+  accessToken  String
+  refreshToken String
+  tokenExpiry  DateTime
+  scopes       String             @default("")
+  status       EmailAccountStatus @default(CONNECTED)
+  lastError    String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  company  Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages EmailMessage[]
+
+  @@unique([companyId, userId, provider])
+  @@index([companyId])
+  @@index([userId])
+  @@index([status])
+}
+
+model EmailMessage {
+  id             String             @id @default(cuid())
+  companyId      String
+  leadId         String
+  emailAccountId String?
+  userId         String?
+  direction      EmailDirection     @default(OUTBOUND)
+  emailType      EmailType?
+  tone           EmailTone?
+  /// Provider message id (Gmail)
+  providerMessageId String?
+  threadId       String?
+  toAddress      String
+  ccAddress      String?
+  bccAddress     String?
+  subject        String
+  bodyText       String
+  bodyHtml       String?
+  status         EmailMessageStatus @default(DRAFT)
+  /// Prevents duplicate sends
+  idempotencyKey String?
+  errorMessage   String?
+  isDemo         Boolean            @default(false)
+  enrollmentId   String?
+  stepId         String?
+  sentAt         DateTime?
+  openedAt       DateTime?
+  repliedAt      DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  company      Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead         Lead                  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  emailAccount EmailAccount?         @relation(fields: [emailAccountId], references: [id], onDelete: SetNull)
+  user         User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
+  enrollment   FollowUpEnrollment?   @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId])
+  @@index([leadId])
+  @@index([threadId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([enrollmentId])
+}
+
+model FollowUpSequence {
+  id          String   @id @default(cuid())
+  companyId   String
+  name        String
+  description String?
+  isDefault   Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  company     Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  steps       FollowUpStep[]
+  enrollments FollowUpEnrollment[]
+
+  @@index([companyId])
+  @@index([isActive])
+}
+
+model FollowUpStep {
+  id         String    @id @default(cuid())
+  sequenceId String
+  stepOrder  Int
+  delayDays  Int       @default(0)
+  emailType  EmailType @default(FOLLOW_UP)
+  tone       EmailTone @default(PROFESSIONAL)
+  enabled    Boolean   @default(true)
+  /// Optional static subject hint for AI
+  subjectHint String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  sequence FollowUpSequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  @@unique([sequenceId, stepOrder])
+  @@index([sequenceId])
+}
+
+model FollowUpEnrollment {
+  id              String                   @id @default(cuid())
+  companyId       String
+  leadId          String
+  sequenceId      String
+  status          SequenceEnrollmentStatus @default(ACTIVE)
+  currentStepOrder Int                     @default(0)
+  nextRunAt       DateTime?
+  lastRunAt       DateTime?
+  startedAt       DateTime                 @default(now())
+  completedAt     DateTime?
+  stoppedAt       DateTime?
+  stopReason      SequenceStopReason?
+  /// Lock token for scheduler idempotency
+  processingLock  String?
+  processingUntil DateTime?
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+
+  company  Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead     Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  sequence FollowUpSequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  messages EmailMessage[]
+
+  @@index([companyId])
+  @@index([leadId])
+  @@index([sequenceId])
+  @@index([status])
+  @@index([nextRunAt])
+}
+
+// ─── Phase 8: Lead Capture + CRM ─────────────────────────────────────────────
+
+enum CrmProvider {
+  HUBSPOT
+  SALESFORCE
+  DEMO
+}
+
+enum CrmConnectionStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+  DEMO
+}
+
+enum LeadImportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model LeadCaptureKey {
+  id         String    @id @default(cuid())
+  companyId  String
+  name       String
+  /// SHA-256 hex of raw key — never store plaintext
+  keyHash    String    @unique
+  /// Visible prefix for UI (e.g. lp_live_abcd)
+  keyPrefix  String
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdById String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([keyPrefix])
+}
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  companyId   String
+  /// Unique per company — replay protection
+  eventId     String
+  source      String
+  payloadHash String?
+  leadId      String?
+  processedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, eventId])
+  @@index([companyId])
+  @@index([source])
+}
+
+model LeadImport {
+  id            String           @id @default(cuid())
+  companyId     String
+  userId        String?
+  filename      String
+  totalRows     Int              @default(0)
+  importedRows  Int              @default(0)
+  duplicateRows Int              @default(0)
+  failedRows    Int              @default(0)
+  status        LeadImportStatus @default(PENDING)
+  errorSummary  String?
+  mappingJson   String?
+  createdAt     DateTime         @default(now())
+  completedAt   DateTime?
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model CrmConnection {
+  id           String              @id @default(cuid())
+  companyId    String
+  userId       String
+  provider     CrmProvider
+  status       CrmConnectionStatus @default(CONNECTED)
+  /// Portal / account label (safe to show)
+  accountLabel String?
+  accessToken  String
+  refreshToken String?
+  tokenExpiry  DateTime?
+  scopes       String              @default("")
+  lastSyncedAt DateTime?
+  lastSyncError String?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, provider])
+  @@index([companyId])
+  @@index([status])
+}
+
+model LeadExternalIdentity {
+  id         String      @id @default(cuid())
+  companyId  String
+  leadId     String
+  provider   CrmProvider
+  externalId String
+  syncStatus String      @default("SYNCED")
+  lastSyncedAt DateTime?
+  lastSyncError String?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lead    Lead    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, provider, externalId])
+  @@index([leadId])
+  @@index([companyId])
+}
+
+// ─── Production foundation: invitations + password reset ─────────────────────
+
+model TeamInvitation {
+  id              String    @id @default(cuid())
+  companyId       String
+  email           String
+  role            UserRole  @default(SALES_REP)
+  /// SHA-256 of raw invite token — never store plaintext
+  tokenHash       String    @unique
+  invitedById     String?
+  expiresAt       DateTime
+  acceptedAt      DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime  @default(now())
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invitedBy User?   @relation("InvitationInviter", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([email])
+  @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  companyId String?
+  userId    String
+  /// SHA-256 of raw token
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
