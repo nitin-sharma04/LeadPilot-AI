@@ -1,49 +1,53 @@
 # Fix: Render cannot use db.*.supabase.co (IPv6-only)
 
 ## Symptom
-`Can't reach database server at db.miixtzoucovwyngonuko.supabase.co:5432`
+`Can't reach database server at db.*.supabase.co:5432`
 
 ## Cause
 That host has **no IPv4 address**. Render only uses IPv4.
 
 ## Fix in Render → Environment
 
-Delete the old `DATABASE_URL` and set **exactly** these two (password already URL-encoded):
+In Supabase: **Project Settings → Database → Connection string → Connection pooling**.
 
-### DATABASE_URL
-```
-postgresql://postgres.miixtzoucovwyngonuko:hh3Xqqywf%3F%2F%23kZv@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true&connection_limit=1
-```
+Use:
 
-### DIRECT_URL
-```
-postgresql://postgres.miixtzoucovwyngonuko:hh3Xqqywf%3F%2F%23kZv@aws-0-ap-south-1.pooler.supabase.com:5432/postgres
-```
+| Env var | Mode | Port | Notes |
+|---------|------|------|--------|
+| `DATABASE_URL` | Transaction | `6543` | Add `?pgbouncer=true&connection_limit=1` |
+| `DIRECT_URL` | Session | `5432` | For `prisma migrate deploy` |
 
-Also set:
+### Required shape
 ```
-APP_URL=https://leadpilot-ai-mnyw.onrender.com
-AUTH_URL=https://leadpilot-ai-mnyw.onrender.com
+postgresql://postgres.<PROJECT_REF>:<URL_ENCODED_PASSWORD>@aws-0-<REGION>.pooler.supabase.com:<PORT>/postgres
 ```
 
 ### Important paste rules
 - Do **not** wrap in quotes on Render
-- Do **not** replace `%3F%2F%23` with raw `?/#` (that causes `invalid port number`)
-- Username must be `postgres.miixtzoucovwyngonuko` (includes project ref)
-- Host must be `aws-0-ap-south-1.pooler.supabase.com` (**not** `db.miixtzoucovwyngonuko.supabase.co`)
+- URL-encode special characters in the password (`?` → `%3F`, `/` → `%2F`, `#` → `%23`)
+- Username must be `postgres.<PROJECT_REF>` (not bare `postgres`)
+- Host must be `….pooler.supabase.com` (**not** `db.<PROJECT_REF>.supabase.co`)
+
+Also set:
+```
+APP_URL=https://<your-render-service>.onrender.com
+AUTH_URL=https://<your-render-service>.onrender.com
+```
 
 Then **Manual Deploy → Clear build cache & deploy**.
 
 ### Verify
-Open: `https://leadpilot-ai-mnyw.onrender.com/api/health`
+Open: `https://<your-service>.onrender.com/api/health`
 
 You want:
 ```json
 {
   "database": "ok",
-  "dbHost": "aws-0-ap-south-1.pooler.supabase.com:6543",
+  "dbHost": "aws-0-<region>.pooler.supabase.com:6543",
   "usesIpv6OnlyDirect": false
 }
 ```
 
-If `dbHost` still shows `db.miixtzoucovwyngonuko.supabase.co:5432`, Render did not pick up the new env var yet.
+If `dbHost` still shows `db.*.supabase.co:5432`, Render did not pick up the new env var yet.
+
+Copy the exact encoded URLs from your local `.env` / `.env.local` (already fixed for this project) into the Render dashboard — do not paste the raw password with `?/#`.
