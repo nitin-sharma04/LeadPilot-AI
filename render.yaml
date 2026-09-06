@@ -6,7 +6,7 @@ services:
     # Use Node 20 LTS (less memory than Node 24 default on Render)
     envVarGroups: []
     buildCommand: npm ci && NODE_OPTIONS=--max-old-space-size=2048 npm run build
-    startCommand: npx prisma migrate deploy && npm start
+    startCommand: npm start
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV

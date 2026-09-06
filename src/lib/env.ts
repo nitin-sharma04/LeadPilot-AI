@@ -46,6 +46,22 @@ export function validateEnvironment(options?: {
   require("DATABASE_URL", "PostgreSQL connection string required");
   require("AUTH_SECRET", "Auth.js session secret required");
 
+  const dbUrl = process.env.DATABASE_URL || "";
+  if (dbUrl.includes("db.") && dbUrl.includes("supabase.co") && !dbUrl.includes("pooler.supabase.com")) {
+    warnings.push({
+      key: "DATABASE_URL",
+      message:
+        "Direct Supabase host db.*.supabase.co is often IPv6-only. Use the pooler (…pooler.supabase.com:6543) on Render.",
+    });
+  }
+  if (isProd && !process.env.DIRECT_URL?.trim()) {
+    warnings.push({
+      key: "DIRECT_URL",
+      message:
+        "Set DIRECT_URL to Supabase session pooler (:5432) for prisma migrate deploy",
+    });
+  }
+
   if (isProd) {
     if (!process.env.APP_URL?.trim() && !process.env.AUTH_URL?.trim()) {
       issues.push({
