@@ -4,8 +4,11 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  /// Pooled connection (Supabase pooler :6543) — use from Render / serverless (IPv4)
+  url       = env("DATABASE_URL")
+  /// Session/direct URL for migrations (Supabase pooler :5432 session mode)
+  directUrl = env("DIRECT_URL")
 }
 
 enum UserRole {

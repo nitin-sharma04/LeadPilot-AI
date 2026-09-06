@@ -2,18 +2,19 @@
 
 Set these in the **hosting dashboard** (never commit real values).
 
-## Required (app will fail or be insecure without these)
+## Required
 
 | Variable | Notes |
 |----------|--------|
-| `DATABASE_URL` | Supabase **direct** Postgres URI (`db.*.supabase.co:5432`), password URL-encoded |
+| `DATABASE_URL` | Supabase **Transaction pooler** (`aws-0-REGION.pooler.supabase.com:6543`) with `?pgbouncer=true&connection_limit=1`. Username is `postgres.PROJECT_REF`. **Do not** use `db.*.supabase.co:5432` on Render — that host is often **IPv6-only** and causes `Can't reach database server`. |
+| `DIRECT_URL` | Supabase **Session pooler** (`…pooler.supabase.com:5432`) for `prisma migrate deploy` |
 | `AUTH_SECRET` | Long random secret (`openssl rand -base64 32`) |
-| `APP_URL` | Public HTTPS origin, e.g. `https://leadpilot.onrender.com` |
-| `AUTH_URL` | Same as `APP_URL` for Auth.js |
+| `APP_URL` | Public HTTPS origin, e.g. `https://leadpilot-ai-mnyw.onrender.com` |
+| `AUTH_URL` | Same as `APP_URL` |
 | `GEMINI_API_KEY` | Required when `AI_PROVIDER=gemini` |
 | `TWILIO_ACCOUNT_SID` | If `VOICE_PROVIDER=twilio` |
 | `TWILIO_AUTH_TOKEN` | If Twilio enabled |
-| `TWILIO_PHONE_NUMBER` | E.164, e.g. `+1…` |
+| `TWILIO_PHONE_NUMBER` | E.164 |
 
 ## Strongly recommended
 
@@ -30,6 +31,10 @@ Set these in the **hosting dashboard** (never commit real values).
 | `DEMO_MODE` | `false` in production |
 | `HUBSPOT_DEMO` | `true` until HubSpot live credentials exist |
 
+## Where to copy pooler URIs in Supabase
+
+Dashboard → **Connect** → **ORMs** → **Prisma** (or Connection pooling) → copy **Transaction** + **Session** strings. Replace `[YOUR-PASSWORD]` and URL-encode special characters.
+
 ## After you get a Render URL
 
 1. Set `APP_URL` + `AUTH_URL` to that HTTPS URL  
@@ -40,7 +45,6 @@ Set these in the **hosting dashboard** (never commit real values).
 ## Verify
 
 ```bash
-# Local (uses .env)
 npx prisma migrate status
 npm run smoke:production
 curl https://YOUR_DOMAIN/api/health

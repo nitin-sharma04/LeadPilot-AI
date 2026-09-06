@@ -16,6 +16,8 @@ services:
       # Set these in the Render dashboard (Supabase URL, secrets). Do not commit secrets.
       - key: DATABASE_URL
         sync: false
+      - key: DIRECT_URL
+        sync: false
       - key: AUTH_SECRET
         sync: false
       - key: APP_URL
