@@ -371,14 +371,16 @@ export function buildGatherTwiml(input: {
   voice?: string;
 }): string {
   const voice = input.voice || "Polly.Joanna";
-  const say = escapeXml(input.sayText.slice(0, 1500));
+  const say = escapeXml(input.sayText.slice(0, 500));
   const action = escapeXml(input.actionUrl);
+  // speechTimeout=1 ends listen quickly after the caller stops talking.
+  // SSML prosody speeds TTS slightly so turns feel more natural.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" speechTimeout="auto" language="en-US" action="${action}" method="POST" actionOnEmptyResult="true">
-    <Say voice="${voice}">${say}</Say>
+  <Gather input="speech" timeout="4" speechTimeout="1" language="en-US" action="${action}" method="POST" actionOnEmptyResult="true">
+    <Say voice="${voice}"><prosody rate="112%">${say}</prosody></Say>
   </Gather>
-  <Say voice="${voice}">I did not catch that. Goodbye for now.</Say>
+  <Say voice="${voice}"><prosody rate="112%">I did not catch that. Goodbye for now.</prosody></Say>
   <Hangup/>
 </Response>`;
 }
@@ -388,10 +390,10 @@ export function buildHangupTwiml(input: {
   voice?: string;
 }): string {
   const voice = input.voice || "Polly.Joanna";
-  const say = escapeXml(input.sayText.slice(0, 1500));
+  const say = escapeXml(input.sayText.slice(0, 500));
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="${voice}">${say}</Say>
+  <Say voice="${voice}"><prosody rate="112%">${say}</prosody></Say>
   <Hangup/>
 </Response>`;
 }

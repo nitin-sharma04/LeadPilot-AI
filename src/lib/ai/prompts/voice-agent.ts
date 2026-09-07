@@ -116,6 +116,31 @@ ${input.leadUtterance}
 Respond with the next short spoken reply as JSON.`;
 }
 
+/** Shorter system prompt for low-latency Gather turns. */
+export const VOICE_AGENT_FAST_SYSTEM_PROMPT = `You are an AI sales assistant on a live phone call.
+Speak naturally and briefly (1-2 short sentences, under 35 words).
+One question at a time. Never claim to be human. No markdown.
+Return ONLY JSON: {"reply":"string","endCall":boolean,"handoffRequested":boolean,"appointmentRequested":boolean,"optOut":boolean}`;
+
+export function buildVoiceAgentFastTurnPrompt(input: {
+  lead: VoiceAgentLeadContext;
+  transcript: Array<{ speaker: "agent" | "lead"; text: string }>;
+  leadUtterance: string;
+}): string {
+  const history = input.transcript
+    .slice(-6)
+    .map((t) => `${t.speaker === "agent" ? "A" : "L"}: ${t.text}`)
+    .join("\n");
+
+  return `Seller: ${input.lead.sellerCompanyName || "our team"}
+Agent: ${input.lead.agentName || "Alex"}
+Lead: ${input.lead.name} (${input.lead.companyName})
+Recent:
+${history || "(none)"}
+Lead just said: "${input.leadUtterance}"
+Reply now as JSON.`;
+}
+
 export const VOICE_TURN_GEMINI_SCHEMA = {
   type: "OBJECT",
   properties: {

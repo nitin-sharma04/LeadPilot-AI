@@ -157,6 +157,43 @@ export async function geminiGenerateContent(input: {
   }
 }
 
+/**
+ * Low-latency path for Twilio Gather turns.
+ * Skips responseSchema (common 503 trigger) and multi-model retry chains.
+ */
+export async function geminiGenerateContentFast(input: {
+  systemPrompt: string;
+  userPrompt: string;
+  timeoutMs?: number;
+}): Promise<GeminiGenerateContentResult> {
+  const base = getGeminiConfig();
+  const model =
+    process.env.GEMINI_VOICE_MODEL?.trim() ||
+    process.env.GEMINI_FALLBACK_MODEL?.trim() ||
+    GEMINI_FALLBACK_MODEL;
+  const timeoutMs =
+    input.timeoutMs && input.timeoutMs > 0
+      ? input.timeoutMs
+      : Number(process.env.GEMINI_VOICE_TIMEOUT_MS) > 0
+        ? Number(process.env.GEMINI_VOICE_TIMEOUT_MS)
+        : 6_000;
+
+  const cfg: GeminiConfig = {
+    ...base,
+    model,
+    timeoutMs,
+  };
+
+  // JSON mime only — no responseSchema, no fallback model chain.
+  return callGenerateContent(
+    input.systemPrompt,
+    input.userPrompt,
+    cfg,
+    false,
+    {}
+  );
+}
+
 async function generateWithSchemaFallback(
   systemPrompt: string,
   userPrompt: string,

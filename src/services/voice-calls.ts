@@ -18,7 +18,7 @@ import {
 } from "@/lib/voice/mode";
 import {
   generateCallSummary,
-  generateVoiceTurn,
+  generateVoiceTurnFast,
 } from "@/lib/ai/voice-agent";
 import type { VoiceAgentLeadContext } from "@/lib/ai/prompts/voice-agent";
 import { normalizeTranscriptText } from "@/lib/voice/transcript-cleanup";
@@ -28,11 +28,71 @@ const lastCallAt = new Map<string, number>();
 const finalizingCalls = new Set<string>();
 const COOLDOWN_MS = 60_000;
 /** Twilio must get TwiML back well under ~15s or it plays "an application error has occurred". */
-const VOICE_AI_DEADLINE_MS = 10_000;
+const VOICE_AI_DEADLINE_MS = 7_000;
 
 function defaultOpening(lead: VoiceAgentLeadContext): string {
   const first = lead.name.split(" ")[0] || "there";
   return `Hi ${first}, this is ${lead.agentName}, an AI assistant calling from ${lead.sellerCompanyName}. Do you have a quick moment to chat about your recent interest?`;
+}
+
+function heuristicVoiceTurn(utterance: string): {
+  reply: string;
+  endCall: boolean;
+  handoffRequested: boolean;
+  appointmentRequested: boolean;
+  optOut: boolean;
+} {
+  const text = utterance.toLowerCase();
+  if (!text.trim()) {
+    return {
+      reply: "Sorry, I did not catch that. Could you say that one more time?",
+      endCall: false,
+      handoffRequested: false,
+      appointmentRequested: false,
+      optOut: false,
+    };
+  }
+  if (
+    /don'?t call|do not call|stop calling|remove me|unsubscribe|not interested/.test(
+      text
+    )
+  ) {
+    return {
+      reply: "Understood. I will make sure we do not call again. Thank you, goodbye.",
+      endCall: true,
+      handoffRequested: false,
+      appointmentRequested: false,
+      optOut: true,
+    };
+  }
+  if (/schedule|meeting|appointment|book|calendar|set up a call/.test(text)) {
+    return {
+      reply:
+        "Perfect. I will have our team schedule a meeting with you and send the details shortly. Thanks, goodbye.",
+      endCall: true,
+      handoffRequested: false,
+      appointmentRequested: true,
+      optOut: false,
+    };
+  }
+  if (/human|person|team|representative|agent|connect (me )?directly/.test(text)) {
+    return {
+      reply:
+        "Absolutely. I will connect you with our team and have someone follow up directly. Thanks for your time, goodbye.",
+      endCall: true,
+      handoffRequested: true,
+      appointmentRequested: false,
+      optOut: false,
+    };
+  }
+  return {
+    reply:
+      "Got it. What is the main goal you are hoping to achieve with this right now?",
+    endCall: false,
+    handoffRequested: false,
+    appointmentRequested: false,
+    optOut: false,
+  };
 }
 
 async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -565,30 +625,37 @@ export async function handleTwilioGather(input: {
   const cfg = getTwilioConfig();
   const utterance = input.speechResult.trim();
 
+  // Persist lead speech without blocking the AI turn.
   if (utterance) {
-    await prisma.callTranscript.create({
-      data: {
-        callId: call.id,
-        speaker: "LEAD",
-        message: utterance,
-      },
-    });
+    void prisma.callTranscript
+      .create({
+        data: {
+          callId: call.id,
+          speaker: "LEAD",
+          message: utterance,
+        },
+      })
+      .catch(() => undefined);
   }
 
   const transcripts = await prisma.callTranscript.findMany({
     where: { callId: call.id },
     orderBy: { timestamp: "asc" },
+    take: 12,
   });
 
   const history = transcripts.map((t) => ({
     speaker: (t.speaker === "AI" ? "agent" : "lead") as "agent" | "lead",
     text: t.message,
   }));
+  if (utterance && !history.some((h) => h.speaker === "lead" && h.text === utterance)) {
+    history.push({ speaker: "lead", text: utterance });
+  }
 
   let turn;
   try {
     turn = await withDeadline(
-      generateVoiceTurn({
+      generateVoiceTurnFast({
         lead,
         transcript: history,
         leadUtterance: utterance || "(no speech detected)",
@@ -600,16 +667,7 @@ export async function handleTwilioGather(input: {
       callId: call.id,
       message: error instanceof Error ? error.message : "unknown",
     });
-    turn = {
-      reply:
-        utterance.trim().length === 0
-          ? "Sorry, I did not catch that. Could you please repeat that briefly?"
-          : "Thanks for sharing that. I'll have someone from our team follow up with you shortly. Goodbye.",
-      endCall: utterance.trim().length > 0,
-      handoffRequested: false,
-      appointmentRequested: false,
-      optOut: false,
-    };
+    turn = heuristicVoiceTurn(utterance);
   }
 
   await prisma.callTranscript.create({
