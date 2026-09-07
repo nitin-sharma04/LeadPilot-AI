@@ -240,34 +240,36 @@ export async function listLeadEmails(companyId: string, leadId: string) {
 }
 
 export async function getCompanyEmailMetrics(companyId: string) {
-  const [sent, failed, received, activeSeq, completedSeq, stoppedSeq, upcoming] =
-    await Promise.all([
-      prisma.emailMessage.count({
-        where: { companyId, status: EmailMessageStatus.SENT },
-      }),
-      prisma.emailMessage.count({
-        where: { companyId, status: EmailMessageStatus.FAILED },
-      }),
-      prisma.emailMessage.count({
-        where: { companyId, direction: EmailDirection.INBOUND },
-      }),
-      prisma.followUpEnrollment.count({
-        where: { companyId, status: "ACTIVE" },
-      }),
-      prisma.followUpEnrollment.count({
-        where: { companyId, status: "COMPLETED" },
-      }),
-      prisma.followUpEnrollment.count({
-        where: { companyId, status: "STOPPED" },
-      }),
-      prisma.followUpEnrollment.count({
-        where: {
-          companyId,
-          status: "ACTIVE",
-          nextRunAt: { gte: new Date() },
-        },
-      }),
-    ]);
+  const [sent, failed, received] = await Promise.all([
+    prisma.emailMessage.count({
+      where: { companyId, status: EmailMessageStatus.SENT },
+    }),
+    prisma.emailMessage.count({
+      where: { companyId, status: EmailMessageStatus.FAILED },
+    }),
+    prisma.emailMessage.count({
+      where: { companyId, direction: EmailDirection.INBOUND },
+    }),
+  ]);
+
+  const [activeSeq, completedSeq, stoppedSeq, upcoming] = await Promise.all([
+    prisma.followUpEnrollment.count({
+      where: { companyId, status: "ACTIVE" },
+    }),
+    prisma.followUpEnrollment.count({
+      where: { companyId, status: "COMPLETED" },
+    }),
+    prisma.followUpEnrollment.count({
+      where: { companyId, status: "STOPPED" },
+    }),
+    prisma.followUpEnrollment.count({
+      where: {
+        companyId,
+        status: "ACTIVE",
+        nextRunAt: { gte: new Date() },
+      },
+    }),
+  ]);
 
   return {
     emailsSent: sent,

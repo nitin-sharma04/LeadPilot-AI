@@ -21,10 +21,9 @@ export default async function DashboardPage() {
   let metrics: Awaited<ReturnType<typeof getDashboardMetrics>>;
   let team: Awaited<ReturnType<typeof listTeam>> = [];
   try {
-    [metrics, team] = await Promise.all([
-      getDashboardMetrics(user),
-      listTeam(user),
-    ]);
+    // Sequential to avoid competing for the same small Prisma pool with layout queries.
+    metrics = await getDashboardMetrics(user);
+    team = await listTeam(user);
   } catch (error) {
     console.error("[dashboard] failed to load metrics", error);
     return (

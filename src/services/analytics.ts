@@ -5,53 +5,59 @@ import type { SessionUser } from "@/lib/session";
 export async function getDashboardMetrics(user: SessionUser) {
   const companyId = user.companyId;
 
-  const [totalLeads, hotLeads, wonDeals, qualifiedLeads, meetings, pipelineAgg, revenueAgg, recentLeads, scoreAgg, analyzedCount] =
-    await Promise.all([
-      prisma.lead.count({ where: { companyId } }),
-      prisma.lead.count({ where: { companyId, score: { gte: 90 } } }),
-      prisma.lead.findMany({
-        where: { companyId, status: LeadStatus.WON },
-        select: { dealValue: true },
-      }),
-      prisma.lead.count({
-        where: {
-          companyId,
-          status: {
-            in: [
-              LeadStatus.QUALIFIED,
-              LeadStatus.MEETING,
-              LeadStatus.PROPOSAL,
-              LeadStatus.WON,
-            ],
-          },
+  // Run in small batches so a low Prisma pool (or cold pooler) cannot P2024.
+  const [totalLeads, hotLeads, wonDeals] = await Promise.all([
+    prisma.lead.count({ where: { companyId } }),
+    prisma.lead.count({ where: { companyId, score: { gte: 90 } } }),
+    prisma.lead.findMany({
+      where: { companyId, status: LeadStatus.WON },
+      select: { dealValue: true },
+    }),
+  ]);
+
+  const [qualifiedLeads, meetings, pipelineAgg] = await Promise.all([
+    prisma.lead.count({
+      where: {
+        companyId,
+        status: {
+          in: [
+            LeadStatus.QUALIFIED,
+            LeadStatus.MEETING,
+            LeadStatus.PROPOSAL,
+            LeadStatus.WON,
+          ],
         },
-      }),
-      prisma.lead.count({ where: { companyId, status: LeadStatus.MEETING } }),
-      prisma.lead.aggregate({
-        where: {
-          companyId,
-          status: { notIn: [LeadStatus.WON, LeadStatus.LOST] },
-        },
-        _sum: { dealValue: true },
-      }),
-      prisma.lead.aggregate({
-        where: { companyId, status: LeadStatus.WON },
-        _sum: { dealValue: true },
-      }),
-      prisma.lead.findMany({
-        where: { companyId },
-        include: { analysis: true, assignedTo: true },
-        orderBy: { createdAt: "desc" },
-        take: 5,
-      }),
-      prisma.lead.aggregate({
-        where: { companyId },
-        _avg: { score: true },
-      }),
-      prisma.leadAnalysis.count({
-        where: { lead: { companyId } },
-      }),
-    ]);
+      },
+    }),
+    prisma.lead.count({ where: { companyId, status: LeadStatus.MEETING } }),
+    prisma.lead.aggregate({
+      where: {
+        companyId,
+        status: { notIn: [LeadStatus.WON, LeadStatus.LOST] },
+      },
+      _sum: { dealValue: true },
+    }),
+  ]);
+
+  const [revenueAgg, recentLeads, scoreAgg, analyzedCount] = await Promise.all([
+    prisma.lead.aggregate({
+      where: { companyId, status: LeadStatus.WON },
+      _sum: { dealValue: true },
+    }),
+    prisma.lead.findMany({
+      where: { companyId },
+      include: { analysis: true, assignedTo: true },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+    }),
+    prisma.lead.aggregate({
+      where: { companyId },
+      _avg: { score: true },
+    }),
+    prisma.leadAnalysis.count({
+      where: { lead: { companyId } },
+    }),
+  ]);
 
   const wonCount = wonDeals.length;
   const revenue = revenueAgg._sum.dealValue ?? 0;
