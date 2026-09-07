@@ -104,7 +104,7 @@ export async function generateVoiceTurnFast(input: {
 
   let parsed: unknown;
   try {
-    parsed = extractJsonObject(completion.content);
+    parsed = extractJsonObject(completion.text);
   } catch {
     throw new AppError(
       "AI returned an invalid response. Please try again.",
