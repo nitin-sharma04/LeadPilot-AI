@@ -119,14 +119,14 @@ export class AppointmentIntentTracker {
     switch (this.status) {
       case "meeting_intent":
       case "collect_date":
-        return "APPOINTMENT FLOW: Lead wants a meeting but date is missing. Ask ONLY for the best day. Do NOT say goodbye. Do NOT claim the team will schedule. Do NOT invent a booking.";
+        return "[INTERNAL] appt=need_date. Ask only for best day. Do not goodbye. Do not claim booking.";
       case "collect_time":
-        return `APPOINTMENT FLOW: Date noted (${this.meetingDate || "day"}). Ask ONLY for a clock time. Do NOT end the call. Do NOT claim booking.`;
+        return `[INTERNAL] appt=need_time date=${this.meetingDate || "?"}. Ask only for clock time. Do not claim booking.`;
       case "proposed":
       case "awaiting_confirmation":
-        return `APPOINTMENT FLOW: Confirm ${this.lastPreferred || "the time"} with the lead before booking. Do NOT hang up yet.`;
+        return `[INTERNAL] appt=confirm "${this.lastPreferred || "time"}". Do not hang up.`;
       case "confirmed":
-        return "APPOINTMENT FLOW: Lead confirmed. Wait for SYSTEM booking result before saying it is booked.";
+        return "[INTERNAL] appt=awaiting_booking_result. Do not claim booked yet.";
       default:
         return null;
     }

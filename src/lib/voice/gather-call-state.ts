@@ -259,8 +259,8 @@ export function sanitizeGatherModelTurn(
   let endCall = turn.endCall;
   let appointmentRequested =
     turn.appointmentRequested || isAppointmentFlowActive(state.appointment);
-  let handoffRequested = turn.handoffRequested;
-  let optOut = turn.optOut;
+  const handoffRequested = turn.handoffRequested;
+  const optOut = turn.optOut;
   let shouldBook = false;
   let preferredTimeText = "";
 

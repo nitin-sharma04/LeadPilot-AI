@@ -182,7 +182,11 @@ clearGatherCallState(callId);
 
 // --- Prompt + voice ---
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE"), "prompt stages");
-assert(REALTIME_HUMAN_SDR_PROMPT.includes("slow down"), "prompt slow");
+assert(
+  REALTIME_HUMAN_SDR_PROMPT.includes("thoda slow") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("slow down"),
+  "prompt slow"
+);
 assert(!REALTIME_HUMAN_SDR_PROMPT.includes("112%"), "prompt no 112");
 assert(resolveGeminiLiveVoice() === "Aoede" || resolveGeminiLiveVoice("Aoede") === "Aoede", "voice");
 
@@ -192,9 +196,11 @@ assert(resolveGeminiLiveVoice() === "Aoede" || resolveGeminiLiveVoice("Aoede") =
     path.join(process.cwd(), "voice-server/src/twilio-stream-handler.ts"),
     "utf8"
   );
-  assert(bridge.includes("sendClear"), "T7 barge-in clear");
+  assert(bridge.includes("clearOutboundAudio") || bridge.includes("sendClear"), "T7 barge-in clear");
   assert(bridge.includes("speechPace"), "speechPace wired");
   assert(bridge.includes("isFlowActive"), "block premature farewell");
+  assert(bridge.includes("OutboundMulawFrameBuffer"), "20ms frame buffer");
+  assert(bridge.includes("sendFarewellMark"), "mark only for farewell");
   const gemini = readFileSync(
     path.join(process.cwd(), "voice-server/src/gemini-live.ts"),
     "utf8"

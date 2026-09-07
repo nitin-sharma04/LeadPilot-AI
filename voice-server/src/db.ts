@@ -114,5 +114,5 @@ ${vocab.join(", ")}
 PRIVATE CONTEXT (never read scores aloud):
 ${privateContext}
 
-Opening: greet briefly, introduce yourself, confirm you caught them at an okay time. One short question only.`;
+Opening: on [EVENT:call_answered], greet casually — name, who you are, company, ask if they have a quick minute. One short question only.`;
 }

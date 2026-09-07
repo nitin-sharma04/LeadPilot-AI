@@ -31,5 +31,5 @@ export function detectsSlowSpeechRequest(utterance: string): boolean {
 }
 
 export function slowSpeechSystemNudge(): string {
-  return "SPEECH PACE: The lead asked you to speak slower. Acknowledge briefly (e.g. \"Of course. I'll slow down.\") then continue. Speak calmly with clear pauses between sentences for the rest of this call. Do not rush.";
+  return "[INTERNAL] speech_pace=slow. Acknowledge briefly, then use shorter clearer sentences for the rest of the call. Do not rush.";
 }

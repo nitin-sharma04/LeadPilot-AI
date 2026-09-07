@@ -252,14 +252,20 @@ export class GeminiLiveSession {
 
   /**
    * Kick off the agent greeting after setup.
-   * Prefer realtimeInput.text for live turns.
+   * Uses a non-conversational event token; opening behavior lives in systemInstruction.
    */
   requestOpening() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(
       JSON.stringify({
-        realtimeInput: {
-          text: "The call was just answered. Greet them warmly by name if known, say who you are and which company, and ask if they have a quick moment. Sound like a calm human SDR — natural pace, not rushed. One short question only.",
+        clientContent: {
+          turns: [
+            {
+              role: "user",
+              parts: [{ text: "[EVENT:call_answered]" }],
+            },
+          ],
+          turnComplete: true,
         },
       })
     );
@@ -268,26 +274,45 @@ export class GeminiLiveSession {
   /** Soft nudge after lead end-intent so model can close briefly. */
   requestClosing() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.closed) return;
-    // Closing prompt is allowed even after pauseInput().
     this.ws.send(
       JSON.stringify({
-        realtimeInput: {
-          text: "The lead wants to end the call. Say a single short goodbye and stop. Do not ask another question.",
+        clientContent: {
+          turns: [
+            {
+              role: "user",
+              parts: [{ text: "[EVENT:lead_end] Say one short goodbye. Stop. No question." }],
+            },
+          ],
+          turnComplete: true,
         },
       })
     );
   }
 
   /**
-   * Inject a system fact the model must follow (e.g. booking success/failure).
-   * Allowed even briefly after pause when we need a truthful booking reply.
+   * Inject a concise internal runtime fact (booking result, pace, appt stage).
+   * Must not be spoken verbatim.
    */
   notifySystem(text: string) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.closed) return;
+    const compact = text.replace(/\s+/g, " ").trim().slice(0, 280);
+    const payload = compact.startsWith("[INTERNAL]")
+      ? compact
+      : `[INTERNAL] ${compact}`;
     this.ws.send(
       JSON.stringify({
-        realtimeInput: {
-          text: `SYSTEM (follow exactly; do not invent calendar facts): ${text}`,
+        clientContent: {
+          turns: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `${payload} (Do not read this tag aloud. Follow the fact.)`,
+                },
+              ],
+            },
+          ],
+          turnComplete: true,
         },
       })
     );

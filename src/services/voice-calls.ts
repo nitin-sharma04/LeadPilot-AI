@@ -41,7 +41,7 @@ function defaultOpening(lead: VoiceAgentLeadContext): string {
   const first = lead.name.split(" ")[0] || "there";
   const agent = lead.agentName || "Alex";
   const seller = lead.sellerCompanyName || "our team";
-  return `Hi ${first}, this is ${agent} calling from ${seller}. Do you have a quick moment to chat about your recent interest?`;
+  return `Hey ${first}, it's ${agent} from ${seller}. You got a quick minute?`;
 }
 
 async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {

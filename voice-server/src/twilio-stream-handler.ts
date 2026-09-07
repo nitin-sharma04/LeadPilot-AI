@@ -1,8 +1,10 @@
 import type WebSocket from "ws";
 import {
+  isVoiceAudioDebugEnabled,
+  logVoiceAudioStats,
   mulaw8kToPcm16kBase64,
   parsePcmSampleRate,
-  pcmBase64ToMulaw8k,
+  StreamingGeminiAudioPipeline,
 } from "./audio.js";
 import {
   bookAppointmentFromVoiceCall,
@@ -19,6 +21,7 @@ import {
   isUnclearUtterance,
 } from "./end-call-intent.js";
 import { GeminiLiveSession } from "./gemini-live.js";
+import { OutboundMulawFrameBuffer } from "./outbound-mulaw-buffer.js";
 import {
   detectsSlowSpeechRequest,
   slowSpeechSystemNudge,
@@ -61,6 +64,9 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   let finalizeApptSent = false;
   let speechPace: SpeechPace = "normal";
   let lastCoachingHint: string | null = null;
+  const audioPipeline = new StreamingGeminiAudioPipeline();
+  const outboundBuffer = new OutboundMulawFrameBuffer();
+  let audioChunkSeq = 0;
 
   const tryBookOnLeadConfirmation = async (leadText: string) => {
     if (!callId || !streamToken || !gemini) return;
@@ -69,7 +75,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
 
     apptTracker.markBookingAttempted();
     // Stop any premature "invite sent" audio already generating.
-    sendClear();
+    clearOutboundAudio();
     finalizer?.discardAgentBuffer();
 
     try {
@@ -91,18 +97,18 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         const when =
           result.displayWhen || result.preferredText || "the agreed time";
         gemini.notifySystem(
-          `Booking succeeded for ${when}${
-            result.timezone ? ` (${result.timezone})` : ""
-          }. Say: they are all set for that time and a calendar invite will be sent. Keep it to 1–2 short sentences. Do not invent a different timezone.`
+          `[INTERNAL] booking_ok when=${when}${
+            result.timezone ? ` tz=${result.timezone}` : ""
+          }. Confirm briefly; invite will be sent. 1–2 sentences.`
         );
       } else if (result.reason === "ambiguous_time") {
         gemini.notifySystem(
-          `Time is still ambiguous. Ask one short clarification for an exact clock time. Do NOT claim an invite was sent.`
+          "[INTERNAL] booking_fail=ambiguous_time. Ask one clock-time clarification. Do not claim invite sent."
         );
       } else {
         apptTracker.markFailed();
         gemini.notifySystem(
-          `Booking failed. Say you could not complete the calendar booking just now and the team will follow up. Do NOT claim an invite was sent.`
+          "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent."
         );
       }
     } catch (error) {
@@ -112,7 +118,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         message: error instanceof Error ? error.message : "unknown",
       });
       gemini.notifySystem(
-        `Booking failed. Say you could not complete the calendar booking just now and the team will follow up. Do NOT claim an invite was sent.`
+        "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent."
       );
     }
   };
@@ -122,28 +128,54 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
   };
 
-  const sendMulawAudio = (mulawB64: string) => {
+  /** Send µ-law media only — no mark (marks are farewell sync only). */
+  const sendMediaFrame = (mulawChunk: Buffer) => {
     if (!streamSid || twilioWs.readyState !== twilioWs.OPEN) return;
     if (endController && !endController.shouldAcceptOutboundAudio) return;
+    if (!mulawChunk.length) return;
     twilioWs.send(
       JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload: mulawB64 },
+        media: { payload: mulawChunk.toString("base64") },
       })
     );
-    markCounter += 1;
-    lastMarkName = `m${markCounter}`;
-    twilioWs.send(
-      JSON.stringify({
-        event: "mark",
-        streamSid,
-        mark: { name: lastMarkName },
-      })
-    );
-    if (endController?.awaitingFarewellMark && lastMarkName) {
-      endController.extendFarewellMark(lastMarkName);
+  };
+
+  const enqueueMulaw = (mulaw: Buffer) => {
+    const frames = outboundBuffer.push(mulaw);
+    for (const frame of frames) sendMediaFrame(frame);
+  };
+
+  /** Flush partial frame + optional farewell mark for hangup sync. */
+  const flushOutbound = (opts?: { sendFarewellMark?: boolean }) => {
+    const tail = audioPipeline.flush();
+    if (tail.length) enqueueMulaw(tail);
+    const rem = outboundBuffer.flush();
+    if (rem) sendMediaFrame(rem);
+
+    if (opts?.sendFarewellMark) {
+      markCounter += 1;
+      lastMarkName = `farewell_${markCounter}`;
+      if (streamSid && twilioWs.readyState === twilioWs.OPEN) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "mark",
+            streamSid,
+            mark: { name: lastMarkName },
+          })
+        );
+      }
+      if (endController?.awaitingFarewellMark && lastMarkName) {
+        endController.extendFarewellMark(lastMarkName);
+      }
     }
+  };
+
+  const clearOutboundAudio = () => {
+    outboundBuffer.clear();
+    audioPipeline.reset();
+    sendClear();
   };
 
   const teardownMedia = () => {
@@ -191,13 +223,15 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
           !endController.isTerminated &&
           !endController.awaitingFarewellMark
         ) {
+          flushOutbound({ sendFarewellMark: true });
           endController.notifyFarewellEnqueued(lastMarkName);
         }
       }, 4000);
     }
 
-    // Agent farewell already played — hang up after the last enqueued mark.
+    // Agent farewell already played — flush remaining audio then mark for hangup sync.
     if (input.reason === "agent_farewell" && input.awaitFarewellDelivery) {
+      flushOutbound({ sendFarewellMark: true });
       endController.notifyFarewellEnqueued(lastMarkName);
     }
 
@@ -334,8 +368,33 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                   typeof sampleRateHz === "number" && sampleRateHz > 0
                     ? sampleRateHz
                     : parsePcmSampleRate(undefined);
-                const mulaw = pcmBase64ToMulaw8k(pcmB64, rate);
-                sendMulawAudio(mulaw);
+                const { mulaw, stats } = audioPipeline.pushPcmBase64(
+                  pcmB64,
+                  rate
+                );
+                audioChunkSeq += 1;
+                if (
+                  isVoiceAudioDebugEnabled() ||
+                  audioChunkSeq === 1 ||
+                  audioChunkSeq % 40 === 0
+                ) {
+                  logVoiceAudioStats(stats, {
+                    callId,
+                    seq: audioChunkSeq,
+                    buffered: outboundBuffer.pendingBytes,
+                    frames: outboundBuffer.emittedFrameCount,
+                  });
+                  if (!isVoiceAudioDebugEnabled() && audioChunkSeq === 1) {
+                    console.info("[voice-audio]", {
+                      callId,
+                      geminiRate: stats.geminiRate,
+                      inputSamples: stats.inputSamples,
+                      outputSamples: stats.outputSamples,
+                      durationMs: Math.round(stats.inputDurationMs),
+                    });
+                  }
+                }
+                enqueueMulaw(mulaw);
               } catch (error) {
                 console.error("[voice-server] audio downconvert failed", {
                   message: error instanceof Error ? error.message : "unknown",
@@ -345,7 +404,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             onInterrupted: () => {
               if (endController?.isEnding) return;
               console.info("[voice-server] barge-in", { callId });
-              sendClear();
+              clearOutboundAudio();
               finalizer?.discardAgentBuffer();
             },
             onInputTranscriptInterim: (text) => {
@@ -374,8 +433,11 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             },
             onGenerationComplete: () => {
               void (async () => {
+                // Finish any partial telephony frames for this model turn.
+                flushOutbound({
+                  sendFarewellMark: Boolean(endController?.isEnding),
+                });
                 if (endController?.isEnding) {
-                  // Closing/farewell audio enqueued — wait for Twilio mark playback.
                   endController.notifyFarewellEnqueued(lastMarkName);
                 }
               })();
@@ -385,10 +447,13 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 if (endController?.isEnding) {
                   await finalizer?.flushLead();
                   await finalizer?.flushAgent();
-                  // Ensure mark wait is armed if generationComplete already fired.
+                  flushOutbound({ sendFarewellMark: true });
                   endController.notifyFarewellEnqueued(lastMarkName);
                   return;
                 }
+
+                // Normal turn: flush remainder without a mark.
+                flushOutbound();
 
                 const leadUtterance = await finalizer?.flushLead();
                 const agentText = await finalizer?.flushAgent();
@@ -402,11 +467,10 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                   agentTurnCount >= 2 &&
                   detectsAgentFarewell(agentText)
                 ) {
-                  // Never hang up mid appointment collection on a premature model goodbye.
                   if (apptTracker.isFlowActive && !apptTracker.hasBooked) {
                     const hint =
                       apptTracker.coachingHint() ||
-                      "Do NOT end the call. Continue the appointment flow (date, time, confirm). Do not claim the team will schedule.";
+                      "[INTERNAL] appt=continue. Do not end. Collect date/time/confirm. No fake booking.";
                     gemini?.notifySystem(hint);
                     return;
                   }
@@ -421,7 +485,6 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 if (!leadUtterance) return;
                 if (isUnclearUtterance(leadUtterance)) return;
 
-                // Backup if confirmation arrived only after flush (idempotent via tracker).
                 await tryBookOnLeadConfirmation(leadUtterance);
 
                 if (detectsSlowSpeechRequest(leadUtterance) && speechPace !== "slow") {
@@ -429,7 +492,6 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                   gemini?.notifySystem(slowSpeechSystemNudge());
                 }
 
-                // Meeting intent is not hangup (detectsEndCallIntent is strict).
                 if (detectsEndCallIntent(leadUtterance)) {
                   const force = detectsForceHangupIntent(leadUtterance);
                   beginEndFlow({

@@ -32,13 +32,21 @@ assert(GEMINI_LIVE_VOICES.includes("Sulafat"), "Sulafat supported");
 // 2 prompt behavior
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("one question"), "one question");
 assert(
-  REALTIME_HUMAN_SDR_PROMPT.includes("NEVER say booked") ||
-    REALTIME_HUMAN_SDR_PROMPT.includes("SYSTEM booking success"),
+  REALTIME_HUMAN_SDR_PROMPT.includes("booking_ok") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("NEVER say booked") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("Only claim booked"),
   "no false booking"
 );
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE"), "appointment stages");
-assert(REALTIME_HUMAN_SDR_PROMPT.includes("slow down"), "pace respect");
+assert(
+  REALTIME_HUMAN_SDR_PROMPT.includes("slow down") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("SPEAK SLOWER") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("thoda slow"),
+  "pace respect"
+);
 assert(!REALTIME_HUMAN_SDR_PROMPT.includes("Certainly. Wonderful."), "no rigid fillers");
+assert(REALTIME_HUMAN_SDR_PROMPT.includes("[EVENT:call_answered]"), "opening event in prompt");
+assert(REALTIME_HUMAN_SDR_PROMPT.includes("Do not force an acknowledgement"), "no forced ack");
 
 // 3 smart transcription config present in gemini-live
 const geminiSrc = readFileSync(
@@ -50,6 +58,8 @@ assert(geminiSrc.includes("prebuiltVoiceConfig"), "speechConfig voice");
 assert(geminiSrc.includes("START_SENSITIVITY_HIGH"), "VAD barge-in");
 assert(geminiSrc.includes("silenceDurationMs"), "VAD silence");
 assert(!geminiSrc.includes("112%"), "no speech acceleration");
+assert(geminiSrc.includes("[EVENT:call_answered]"), "opening event token");
+assert(geminiSrc.includes("clientContent"), "clientContent opening");
 
 // Gather must not accelerate TTS
 const gatherTwiml = buildGatherTwiml({ sayText: "Hi", actionUrl: "https://x/g" });
