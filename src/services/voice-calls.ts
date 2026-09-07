@@ -8,6 +8,7 @@ import {
   buildGatherTwiml,
   buildHangupTwiml,
   endTwilioCall,
+  fetchTwilioCallStatus,
   getTwilioConfig,
 } from "@/lib/voice/twilio-client";
 import {
@@ -113,6 +114,42 @@ export async function reconcileStaleCall<
   return { ...call, ...updated };
 }
 
+/**
+ * When status webhooks are missed, sync terminal Twilio state into our DB
+ * so the dashboard stops showing "Call in progress".
+ */
+export async function syncCallStatusFromTwilio<
+  T extends {
+    id: string;
+    status: CallStatus;
+    providerCallId: string | null;
+    answeredAt?: Date | null;
+    outcome?: string | null;
+  },
+>(call: T): Promise<T> {
+  if (!call.providerCallId || !ACTIVE_STATUSES.includes(call.status)) {
+    return call;
+  }
+
+  const remote = await fetchTwilioCallStatus(call.providerCallId);
+  if (!remote.status) return call;
+
+  const mapped = mapTwilioStatus(remote.status);
+  if (!mapped) return call;
+  if (mapped === call.status) return call;
+
+  await handleTwilioStatus({
+    callId: call.id,
+    callStatus: remote.status,
+    callDuration:
+      remote.duration != null ? String(remote.duration) : undefined,
+  });
+
+  const refreshed = await prisma.call.findUnique({ where: { id: call.id } });
+  if (!refreshed) return call;
+  return { ...call, ...refreshed };
+}
+
 export async function cancelStaleCallsForLead(input: {
   companyId: string;
   leadId: string;
@@ -125,7 +162,8 @@ export async function cancelStaleCallsForLead(input: {
     },
   });
   for (const call of active) {
-    await reconcileStaleCall(call);
+    const synced = await syncCallStatusFromTwilio(call);
+    await reconcileStaleCall(synced);
   }
 }
 function normalizePhone(raw: string): string | null {
@@ -355,8 +393,13 @@ export async function getCallForUser(user: SessionUser, callId: string) {
   });
   if (!call) throw new AppError("Call not found", 404);
 
-  const reconciled = await reconcileStaleCall(call);
-  if (reconciled.status !== call.status) {
+  // Prefer live Twilio state over a missed status webhook, then stale timeout.
+  const synced = await syncCallStatusFromTwilio(call);
+  const reconciled = await reconcileStaleCall(synced);
+  if (
+    reconciled.status !== call.status ||
+    synced.status !== call.status
+  ) {
     return prisma.call.findFirstOrThrow({
       where: { id: callId, companyId: user.companyId },
       include: {
@@ -391,6 +434,14 @@ export async function handleTwilioAnswer(callId: string): Promise<string> {
     const streamUrl = getVoiceStreamUrl();
     if (!streamUrl) {
       console.error("[voice] realtime call missing VOICE_STREAM_URL; failing safely");
+      await prisma.call.update({
+        where: { id: call.id },
+        data: {
+          status: CallStatus.FAILED,
+          endedAt: new Date(),
+          outcome: "Realtime voice stream not configured",
+        },
+      });
       return buildHangupTwiml({
         sayText:
           "Sorry, our realtime voice service is not available right now. Please try again later. Goodbye.",

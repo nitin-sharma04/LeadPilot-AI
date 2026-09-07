@@ -81,8 +81,11 @@ export async function initiateTwilioOutboundCall(
     Method: "POST",
     StatusCallback: statusUrl,
     StatusCallbackMethod: "POST",
-    StatusCallbackEvent: ["initiated", "ringing", "answered", "completed"].join(" "),
   });
+  // Twilio requires repeating StatusCallbackEvent (not a single space-joined value).
+  for (const event of ["initiated", "ringing", "answered", "completed"] as const) {
+    body.append("StatusCallbackEvent", event);
+  }
 
   const auth = Buffer.from(`${cfg.accountSid}:${cfg.authToken}`).toString(
     "base64"
@@ -137,9 +140,15 @@ export async function initiateTwilioOutboundCall(
         503
       );
     }
-    if (message.includes("phone") || message.includes("number")) {
+    if (json.code === 21219) {
       throw new AppError(
-        "Twilio rejected the phone number. Use a valid E.164 number.",
+        "Twilio trial accounts can only call verified numbers. Verify this phone in the Twilio Console, or upgrade the account.",
+        400
+      );
+    }
+    if (message.includes("phone") || message.includes("number") || message.includes("verified")) {
+      throw new AppError(
+        "Twilio rejected the phone number. Use a valid E.164 number (and verify it if on a Twilio trial).",
         400
       );
     }
@@ -168,6 +177,64 @@ export async function initiateTwilioOutboundCall(
     providerCallId: sid,
     status: typeof json.status === "string" ? json.status : "queued",
   };
+}
+
+/**
+ * Terminate an in-progress Twilio call via REST (Status=completed).
+ * Server-side only. Never logs the auth token.
+ */
+export async function fetchTwilioCallStatus(providerCallId: string): Promise<{
+  status: string | null;
+  duration: number | null;
+  errorType?: string;
+}> {
+  if (!providerCallId?.trim()) {
+    return { status: null, duration: null, errorType: "missing_provider_call_sid" };
+  }
+
+  let cfg: TwilioConfig;
+  try {
+    cfg = getTwilioConfig();
+  } catch {
+    return { status: null, duration: null, errorType: "missing_twilio_credentials" };
+  }
+
+  const auth = Buffer.from(`${cfg.accountSid}:${cfg.authToken}`).toString(
+    "base64"
+  );
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${cfg.accountSid}/Calls/${encodeURIComponent(providerCallId.trim())}.json`;
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Basic ${auth}` },
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      return {
+        status: null,
+        duration: null,
+        errorType: "provider_error",
+      };
+    }
+    const json = (await response.json()) as {
+      status?: string;
+      duration?: string | number;
+    };
+    const durationRaw = json.duration;
+    const duration =
+      typeof durationRaw === "number"
+        ? durationRaw
+        : typeof durationRaw === "string"
+          ? Number.parseInt(durationRaw, 10)
+          : null;
+    return {
+      status: typeof json.status === "string" ? json.status : null,
+      duration: Number.isFinite(duration) ? duration : null,
+    };
+  } catch {
+    return { status: null, duration: null, errorType: "network" };
+  }
 }
 
 /**
@@ -262,12 +329,28 @@ export function validateTwilioRequest(input: {
         params: Record<string, string>
       ) => boolean;
     };
-    return twilio.validateRequest(
-      authToken,
-      input.signature,
-      input.url,
-      input.params
-    );
+
+    const candidates = new Set<string>([input.url]);
+    try {
+      const parsed = new URL(input.url);
+      candidates.add(parsed.toString());
+      // Some proxies rewrite the signed URL without query encoding differences.
+      candidates.add(`${parsed.origin}${parsed.pathname}${parsed.search}`);
+      if (parsed.search) {
+        candidates.add(`${parsed.origin}${parsed.pathname}`);
+      }
+    } catch {
+      /* keep original */
+    }
+
+    for (const url of candidates) {
+      if (
+        twilio.validateRequest(authToken, input.signature, url, input.params)
+      ) {
+        return true;
+      }
+    }
+    return false;
   } catch {
     return false;
   }

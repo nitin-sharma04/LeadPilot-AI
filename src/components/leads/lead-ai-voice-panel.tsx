@@ -133,7 +133,7 @@ export function LeadAiVoicePanel({
     if (!live?.id || !ACTIVE.has(live.status)) return;
     const timer = window.setInterval(() => {
       void refreshCall(live.id);
-    }, 3000);
+    }, 2000);
     return () => window.clearInterval(timer);
   }, [live?.id, live?.status, refreshCall]);
 

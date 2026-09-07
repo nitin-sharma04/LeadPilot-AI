@@ -50,9 +50,17 @@ export function isRealtimeConfigured(): boolean {
   return Boolean(getVoiceStreamUrl() && process.env.GEMINI_API_KEY?.trim());
 }
 
+export function isEphemeralVoiceStreamUrl(url: string | null): boolean {
+  if (!url) return false;
+  return /trycloudflare\.com|ngrok-free\.app|ngrok\.io|loca\.lt|cloudflared/i.test(
+    url
+  );
+}
+
 /**
  * Resolve the effective mode for a call.
  * If realtime is requested but stream URL/Gemini key missing → turn_based fallback.
+ * Ephemeral tunnels (cloudflare/ngrok) are not reliable on Render unless explicitly allowed.
  */
 export function resolveEffectiveVoiceMode(): {
   mode: VoiceMode;
@@ -62,11 +70,25 @@ export function resolveEffectiveVoiceMode(): {
   if (requested === "turn_based") {
     return { mode: "turn_based" };
   }
-  if (!getVoiceStreamUrl()) {
+  const streamUrl = getVoiceStreamUrl();
+  if (!streamUrl) {
     return {
       mode: "turn_based",
       fallbackReason:
         "VOICE_STREAM_URL / VOICE_SERVER_URL not configured for realtime media.",
+    };
+  }
+  const allowTunnel =
+    process.env.VOICE_ALLOW_TUNNEL?.trim().toLowerCase() === "true";
+  if (
+    process.env.NODE_ENV === "production" &&
+    isEphemeralVoiceStreamUrl(streamUrl) &&
+    !allowTunnel
+  ) {
+    return {
+      mode: "turn_based",
+      fallbackReason:
+        "Ephemeral VOICE_STREAM_URL tunnel (cloudflare/ngrok) is not allowed in production without VOICE_ALLOW_TUNNEL=true. Using turn-based voice.",
     };
   }
   if (!process.env.GEMINI_API_KEY?.trim()) {
