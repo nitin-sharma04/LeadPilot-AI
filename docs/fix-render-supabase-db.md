@@ -14,7 +14,7 @@ Use:
 
 | Env var | Mode | Port | Notes |
 |---------|------|------|--------|
-| `DATABASE_URL` | Transaction | `6543` | Add `?pgbouncer=true&connection_limit=1` |
+| `DATABASE_URL` | Transaction | `6543` | Add `?pgbouncer=true&connection_limit=5&pool_timeout=30` (not `connection_limit=1` on Render) |
 | `DIRECT_URL` | Session | `5432` | For `prisma migrate deploy` |
 
 ### Required shape

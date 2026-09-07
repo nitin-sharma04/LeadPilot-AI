@@ -6,7 +6,7 @@ Set these in the **hosting dashboard** (never commit real values).
 
 | Variable | Notes |
 |----------|--------|
-| `DATABASE_URL` | Supabase **Transaction pooler** (`aws-0-REGION.pooler.supabase.com:6543`) with `?pgbouncer=true&connection_limit=1`. Username is `postgres.PROJECT_REF`. **Do not** use `db.*.supabase.co:5432` on Render — that host is often **IPv6-only** and causes `Can't reach database server`. |
+| `DATABASE_URL` | Supabase **Transaction pooler** (`aws-0-REGION.pooler.supabase.com:6543`) with `?pgbouncer=true&connection_limit=5&pool_timeout=30`. Username is `postgres.PROJECT_REF`. **Do not** use `db.*.supabase.co:5432` on Render — that host is often **IPv6-only**. On Render (long-running), avoid `connection_limit=1` — it causes `P2024` pool timeouts on the dashboard. |
 | `DIRECT_URL` | Supabase **Session pooler** (`…pooler.supabase.com:5432`) for `prisma migrate deploy` |
 | `AUTH_SECRET` | Long random secret (`openssl rand -base64 32`) |
 | `APP_URL` | Public HTTPS origin, e.g. `https://leadpilot-ai-mnyw.onrender.com` |

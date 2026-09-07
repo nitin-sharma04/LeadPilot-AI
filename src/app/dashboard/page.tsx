@@ -18,10 +18,27 @@ export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
   const user = await requireSession();
-  const [metrics, team] = await Promise.all([
-    getDashboardMetrics(user),
-    listTeam(user),
-  ]);
+  let metrics: Awaited<ReturnType<typeof getDashboardMetrics>>;
+  let team: Awaited<ReturnType<typeof listTeam>> = [];
+  try {
+    [metrics, team] = await Promise.all([
+      getDashboardMetrics(user),
+      listTeam(user),
+    ]);
+  } catch (error) {
+    console.error("[dashboard] failed to load metrics", error);
+    return (
+      <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-6">
+        <h1 className="text-lg font-semibold">Dashboard temporarily unavailable</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          We could not load your pipeline data from the database. Refresh in a
+          moment. If this keeps happening, check Render{" "}
+          <code className="text-xs">DATABASE_URL</code> (use the Supabase pooler
+          with <code className="text-xs">connection_limit=5</code>).
+        </p>
+      </div>
+    );
+  }
 
   const recent = metrics.recentLeads.map(mapLeadToUi);
   const ownerNames = Object.fromEntries(team.map((m) => [m.id, m.name]));
