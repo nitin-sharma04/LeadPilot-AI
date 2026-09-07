@@ -12,6 +12,8 @@ import {
   normalizeTranscriptText,
   shouldSkipDuplicate,
   markUnclearIfEmpty,
+  finalizeLeadUtterance,
+  isInternalTranscript,
 } from "../src/lib/voice/transcript-cleanup";
 import { buildConnectStreamTwiml, buildGatherTwiml } from "../src/lib/voice/twilio-client";
 import { resolveEffectiveVoiceMode } from "../src/lib/voice/mode";
@@ -146,5 +148,17 @@ assert(
 assert(normalizeTranscriptText("hello   hello") === "Hello", "cleanup dup");
 assert(markUnclearIfEmpty("um") === "[unclear]", "unclear marker");
 assert(isUnclearUtterance("[unclear]"), "unclear detect");
+assert(finalizeLeadUtterance("", null) === null, "empty lead is not unclear");
+assert(finalizeLeadUtterance("um", null) === null, "uh/um not unclear row");
+assert(isInternalTranscript("[INTERNAL] booking_ok"), "internal detected");
+assert(finalizeLeadUtterance("[INTERNAL] booking_ok", null) === null, "internal not lead");
+assert(
+  finalizeLeadUtterance("[unclear]", "[unclear]") === null,
+  "no consecutive unclear"
+);
+assert(
+  shouldSkipDuplicate("Yeah I'm looking for more leads.", "Yeah"),
+  "shorter prefix skipped"
+);
 
 console.log("Realtime human-voice verification passed.");

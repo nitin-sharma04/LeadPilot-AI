@@ -33,6 +33,9 @@ yarn-error.log*
 .env*
 !.env.example
 
+# Local Deepgram TTS experiment outputs (do not commit)
+/audio/
+
 # vercel
 .vercel
 

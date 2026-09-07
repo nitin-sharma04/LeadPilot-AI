@@ -1,5 +1,5 @@
 import { DashboardShell } from "@/components/layout/dashboard-shell";
-import { requireSession } from "@/lib/session";
+import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
@@ -11,7 +11,11 @@ export default async function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const user = await requireSession();
+  const session = await auth();
+  if (!session?.user?.id || !session.user.companyId) {
+    redirect("/login");
+  }
+  const user = session.user;
   const company = await prisma.company.findUnique({
     where: { id: user.companyId },
     select: {

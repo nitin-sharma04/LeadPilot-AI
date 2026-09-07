@@ -17,6 +17,7 @@ export type VoiceApptStatus =
   | "proposed"
   | "awaiting_confirmation"
   | "confirmed"
+  | "booking"
   | "booked"
   | "failed"
   | "declined";
@@ -64,7 +65,7 @@ export class AppointmentIntentTracker {
     return this.meetingTime;
   }
 
-  /** True while date/time/confirm still needed — do not hang up. */
+  /** True while date/time/confirm/booking still needed — do not hang up. */
   get isFlowActive() {
     return (
       this.status === "meeting_intent" ||
@@ -72,7 +73,8 @@ export class AppointmentIntentTracker {
       this.status === "collect_time" ||
       this.status === "proposed" ||
       this.status === "awaiting_confirmation" ||
-      this.status === "confirmed"
+      this.status === "confirmed" ||
+      this.status === "booking"
     );
   }
 
@@ -124,8 +126,9 @@ export class AppointmentIntentTracker {
         return `[INTERNAL] appt=need_time date=${this.meetingDate || "?"}. Ask only for clock time. Do not claim booking.`;
       case "proposed":
       case "awaiting_confirmation":
-        return `[INTERNAL] appt=confirm "${this.lastPreferred || "time"}". Do not hang up.`;
+        return `[INTERNAL] appt=confirm "${this.lastPreferred || "time"}". Ask if that time works. Do not claim booked or invite. Do not hang up.`;
       case "confirmed":
+      case "booking":
         return "[INTERNAL] appt=awaiting_booking_result. Do not claim booked yet.";
       default:
         return null;
@@ -134,17 +137,23 @@ export class AppointmentIntentTracker {
 
   /**
    * True when lead just confirmed a previously proposed concrete time.
+   * Giving a clock time is NOT confirmation — even if the phrase contains "sure".
    */
   shouldAttemptBooking(latestLead: string): boolean {
-    if (this.bookingAttempted || this.status === "booked") return false;
+    if (this.bookingAttempted || this.status === "booked" || this.status === "booking") {
+      return false;
+    }
     if (!this.hasBookablePhrase() || this.isAmbiguousOnly()) return false;
+    if (this.isTimeOfferingWithoutConfirm(latestLead)) return false;
     if (!isClearAppointmentConfirmation(latestLead)) return false;
     const prior = this.leadLines.slice(0, -1);
     const hadProposal = prior.some(
       (l) => CLOCK_RE.test(l) || (DAY_RE.test(l) && CLOCK_RE.test(this.lastPreferred))
     );
     const selfConfirm =
-      CLOCK_RE.test(latestLead) && isClearAppointmentConfirmation(latestLead);
+      CLOCK_RE.test(latestLead) &&
+      isClearAppointmentConfirmation(latestLead) &&
+      !this.isTimeOfferingWithoutConfirm(latestLead);
     if (!hadProposal && !selfConfirm) {
       if (
         this.status !== "proposed" &&
@@ -154,12 +163,12 @@ export class AppointmentIntentTracker {
       }
     }
     this.status = "confirmed";
-    this.bookingAttempted = true;
     return true;
   }
 
   markBookingAttempted() {
     this.bookingAttempted = true;
+    if (this.status !== "booked") this.status = "booking";
   }
 
   markBooked() {
@@ -172,12 +181,20 @@ export class AppointmentIntentTracker {
     this.bookingAttempted = true;
   }
 
+  resetBookingAttempt() {
+    this.bookingAttempted = false;
+    if (this.status === "booking" || this.status === "confirmed") {
+      this.status = "proposed";
+    }
+  }
+
   private refreshCollectionStage() {
     if (
       this.status === "booked" ||
       this.status === "failed" ||
       this.status === "declined" ||
       this.status === "confirmed" ||
+      this.status === "booking" ||
       this.status === "awaiting_confirmation"
     ) {
       return;
@@ -194,6 +211,13 @@ export class AppointmentIntentTracker {
         this.status = "proposed";
       }
     }
+  }
+
+  private isTimeOfferingWithoutConfirm(latestLead: string): boolean {
+    if (!CLOCK_RE.test(latestLead)) return false;
+    return !/\b(yes|yeah|yep|yup|confirm|confirmed|book it|sounds good|that works|works for me|let'?s do it)\b/i.test(
+      latestLead
+    );
   }
 
   private hasBookablePhrase(): boolean {

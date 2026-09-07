@@ -24,7 +24,7 @@ import {
 } from "../src/lib/voice/gather-call-state";
 import { buildGatherTwiml, buildHangupTwiml } from "../src/lib/voice/twilio-client";
 import { REALTIME_HUMAN_SDR_PROMPT } from "../src/lib/ai/prompts/realtime-voice";
-import { resolveGeminiLiveVoice } from "../voice-server/src/config";
+import { resolveGeminiLiveVoice, getVadSilenceMs } from "../voice-server/src/config";
 
 function assert(c: boolean, m: string) {
   if (!c) throw new Error(`FAIL: ${m}`);
@@ -146,6 +146,10 @@ clearGatherCallState(callId);
   tr.noteLead("Around 8 PM.");
   assert(tr.preferredText.length > 0, "preferred built");
   assert(!tr.shouldAttemptBooking("Around 8 PM."), "no book before confirm");
+  assert(
+    !tr.shouldAttemptBooking("At around 5:00 p.m. Indian time is standard."),
+    "time offer is not confirm"
+  );
   assert(tr.shouldAttemptBooking("Yes."), "book after confirm");
 }
 
@@ -189,6 +193,15 @@ assert(
 );
 assert(!REALTIME_HUMAN_SDR_PROMPT.includes("112%"), "prompt no 112");
 assert(resolveGeminiLiveVoice() === "Aoede" || resolveGeminiLiveVoice("Aoede") === "Aoede", "voice");
+{
+  const prevVad = process.env.GEMINI_VAD_SILENCE_MS;
+  delete process.env.GEMINI_VAD_SILENCE_MS;
+  assert(getVadSilenceMs() === 500, "VAD default 500");
+  if (prevVad !== undefined) process.env.GEMINI_VAD_SILENCE_MS = prevVad;
+}
+assert(getVadSilenceMs("700") === 700, "VAD 700");
+assert(getVadSilenceMs("300") === 400, "VAD clamp min");
+assert(getVadSilenceMs("2000") === 750, "VAD clamp max");
 
 // --- Barge-in still present ---
 {
@@ -205,7 +218,7 @@ assert(resolveGeminiLiveVoice() === "Aoede" || resolveGeminiLiveVoice("Aoede") =
     path.join(process.cwd(), "voice-server/src/gemini-live.ts"),
     "utf8"
   );
-  assert(gemini.includes("silenceDurationMs: 950"), "VAD 950ms");
+  assert(gemini.includes("silenceDurationMs: this.vadSilenceMs"), "VAD configurable");
   assert(!gemini.includes("112%"), "no accel in live");
   const voiceCalls = readFileSync(
     path.join(process.cwd(), "src/services/voice-calls.ts"),

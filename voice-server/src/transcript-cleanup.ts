@@ -3,6 +3,59 @@
  * (Mirrored in src/lib/voice/transcript-cleanup.ts for the Next.js app.)
  */
 
+export function isInternalTranscript(text: string): boolean {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t) return true;
+  if (/\[INTERNAL\]/i.test(t)) return true;
+  if (/\[EVENT:/i.test(t)) return true;
+  if (/^\[system\]/i.test(t)) return true;
+  if (/\bbooking_ok\b|\bbooking_fail\b|\bspeech_pace=/i.test(t)) return true;
+  if (/do not read this tag aloud|follow the fact/i.test(t)) return true;
+  if (/^(SYSTEM|DEBUG|TOOL)\s*:/i.test(t)) return true;
+  return false;
+}
+
+/**
+ * Merge streaming STT chunks into one utterance.
+ * Prefer cumulative replacements over concatenating duplicates.
+ */
+export function mergeStreamingTranscript(buffer: string, chunk: string): string {
+  const b = buffer.replace(/\s+/g, " ").trim();
+  const c = chunk.replace(/\s+/g, " ").trim();
+  if (!c) return b;
+  if (!b) return c;
+  if (c === b) return b;
+  if (c.startsWith(b) || c.includes(b)) return c;
+  if (b.startsWith(c) || b.includes(c)) return b;
+  const bHead = b.slice(0, Math.min(16, b.length)).toLowerCase();
+  const cHead = c.slice(0, Math.min(16, c.length)).toLowerCase();
+  if (
+    bHead &&
+    cHead &&
+    (b.toLowerCase().startsWith(cHead) || c.toLowerCase().startsWith(bHead))
+  ) {
+    return c.length >= b.length ? c : b;
+  }
+  return `${b} ${c}`.trim();
+}
+
+/**
+ * Decide whether a buffered lead utterance should appear in the user-facing transcript.
+ * Empty / interim-only / uh-um / internal events must not become "[unclear]".
+ */
+export function finalizeLeadUtterance(
+  raw: string,
+  lastLead: string | null | undefined
+): string | null {
+  if (isInternalTranscript(raw)) return null;
+  const text = normalizeTranscriptText(raw);
+  if (!text) return null;
+  if (/^(uh+|um+|er+|ah+|\.\.\.|…)$/i.test(text)) return null;
+  if (text === "[unclear]" && lastLead === "[unclear]") return null;
+  if (shouldSkipDuplicate(lastLead, text)) return null;
+  return text;
+}
+
 export function normalizeTranscriptText(raw: string): string {
   let text = raw.replace(/\s+/g, " ").trim();
   if (!text) return "";

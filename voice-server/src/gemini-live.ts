@@ -1,5 +1,9 @@
 import WebSocket from "ws";
-import { resolveGeminiLiveVoice, type GeminiLiveVoice } from "./config.js";
+import {
+  getVadSilenceMs,
+  resolveGeminiLiveVoice,
+  type GeminiLiveVoice,
+} from "./config.js";
 
 export type GeminiLiveHandlers = {
   /** PCM audio from Gemini Live; sampleRateHz from mime (usually 24000). */
@@ -8,19 +12,24 @@ export type GeminiLiveHandlers = {
   /** Interim lead transcription (do not persist). */
   onInputTranscriptInterim?: (text: string) => void;
   /** Final-ish lead transcription chunk (may still be incremental). */
-  onInputTranscript?: (text: string) => void;
-  onOutputTranscript?: (text: string) => void;
+  onInputTranscript?: (text: string, meta?: { finished?: boolean }) => void;
+  onOutputTranscript?: (text: string, meta?: { finished?: boolean }) => void;
   onTurnComplete?: () => void;
   onGenerationComplete?: () => void;
   onError?: (message: string) => void;
   onSetupComplete?: () => void;
 };
 
+export type GeminiLiveResponseModality = "AUDIO" | "TEXT";
+
 export type GeminiLiveSessionOptions = {
   apiKey: string;
   model: string;
   systemInstruction: string;
   voice?: GeminiLiveVoice;
+  /** AUDIO (default) or TEXT when an external TTS provider speaks. */
+  responseModalities?: GeminiLiveResponseModality[];
+  vadSilenceMs?: number;
   handlers: GeminiLiveHandlers;
 };
 
@@ -43,6 +52,8 @@ export class GeminiLiveSession {
   private readonly model: string;
   private readonly systemInstruction: string;
   private readonly handlers: GeminiLiveHandlers;
+  private readonly responseModalities: GeminiLiveResponseModality[];
+  private readonly vadSilenceMs: number;
 
   constructor(options: GeminiLiveSessionOptions) {
     this.apiKey = options.apiKey;
@@ -50,6 +61,10 @@ export class GeminiLiveSession {
     this.systemInstruction = options.systemInstruction;
     this.handlers = options.handlers;
     this.voice = options.voice || resolveGeminiLiveVoice();
+    this.responseModalities = options.responseModalities?.length
+      ? options.responseModalities
+      : ["AUDIO"];
+    this.vadSilenceMs = options.vadSilenceMs ?? getVadSilenceMs();
   }
 
   get selectedVoice(): GeminiLiveVoice {
@@ -62,29 +77,45 @@ export class GeminiLiveSession {
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(url);
       this.ws = ws;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
 
-      const timer = setTimeout(() => {
-        reject(new Error("Gemini Live connection timeout"));
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        fn();
+      };
+
+      timer = setTimeout(() => {
+        finish(() => {
+          reject(new Error("Gemini Live connection timeout"));
+          try {
+            ws.close();
+          } catch {
+            /* ignore */
+          }
+        });
       }, 15000);
 
       ws.on("open", () => {
+        const useAudio = this.responseModalities.includes("AUDIO");
         const setup = {
           setup: {
             model: `models/${this.model}`,
             generationConfig: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: {
-                    voiceName: this.voice,
-                  },
-                },
-              },
+              responseModalities: this.responseModalities,
+              ...(useAudio
+                ? {
+                    speechConfig: {
+                      voiceConfig: {
+                        prebuiltVoiceConfig: {
+                          voiceName: this.voice,
+                        },
+                      },
+                    },
+                  }
+                : {}),
               thinkingConfig: {
                 thinkingLevel: "minimal",
               },
@@ -96,16 +127,16 @@ export class GeminiLiveSession {
             inputAudioTranscription: {
               mode: "SMART",
             },
-            outputAudioTranscription: {},
+            ...(useAudio ? { outputAudioTranscription: {} } : {}),
             // VAD: barge-in promptly; allow natural pauses so full utterances
             // like "Schedule a meeting with your members" complete before turn end.
             realtimeInputConfig: {
               automaticActivityDetection: {
                 disabled: false,
                 startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
-                endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-                prefixPaddingMs: 40,
-                silenceDurationMs: 950,
+                endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
+                prefixPaddingMs: 20,
+                silenceDurationMs: this.vadSilenceMs,
               },
             },
           },
@@ -116,10 +147,18 @@ export class GeminiLiveSession {
       ws.on("message", (data) => {
         try {
           const msg = JSON.parse(data.toString());
+          if (msg.error) {
+            const errObj = msg.error as { message?: string; code?: number };
+            const message = (errObj.message || "gemini live error").slice(0, 200);
+            this.handlers.onError?.(message);
+            finish(() => reject(new Error(message)));
+            return;
+          }
           if (msg.setupComplete) {
-            clearTimeout(timer);
-            this.handlers.onSetupComplete?.();
-            resolve();
+            finish(() => {
+              this.handlers.onSetupComplete?.();
+              resolve();
+            });
             return;
           }
           this.handleServerMessage(msg);
@@ -131,14 +170,15 @@ export class GeminiLiveSession {
       });
 
       ws.on("error", (err) => {
-        clearTimeout(timer);
         this.handlers.onError?.(err.message);
-        reject(err);
+        finish(() => reject(err));
       });
 
       ws.on("close", () => {
         this.closed = true;
-        clearTimeout(timer);
+        finish(() =>
+          reject(new Error("Gemini Live closed before setup complete"))
+        );
       });
     });
   }
@@ -177,17 +217,24 @@ export class GeminiLiveSession {
     }
 
     if (serverContent.inputTranscription?.text) {
-      this.handlers.onInputTranscript?.(serverContent.inputTranscription.text);
+      this.handlers.onInputTranscript?.(
+        serverContent.inputTranscription.text,
+        { finished: Boolean(serverContent.inputTranscription.finished) }
+      );
     }
 
     if (serverContent.outputTranscription?.text) {
       this.handlers.onOutputTranscript?.(
-        serverContent.outputTranscription.text
+        serverContent.outputTranscription.text,
+        { finished: Boolean(serverContent.outputTranscription.finished) }
       );
     }
 
     const parts = serverContent.modelTurn?.parts ?? [];
     for (const part of parts) {
+      if (part.text) {
+        this.handlers.onOutputTranscript?.(part.text);
+      }
       const data = part.inlineData?.data;
       const mime = part.inlineData?.mimeType || "";
       if (!(data && mime.includes("audio"))) continue;
@@ -292,8 +339,9 @@ export class GeminiLiveSession {
   /**
    * Inject a concise internal runtime fact (booking result, pace, appt stage).
    * Must not be spoken verbatim.
+   * generate=false: do not start a new model turn (avoids [INTERNAL] speech).
    */
-  notifySystem(text: string) {
+  notifySystem(text: string, opts?: { generate?: boolean }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.closed) return;
     const compact = text.replace(/\s+/g, " ").trim().slice(0, 280);
     const payload = compact.startsWith("[INTERNAL]")
@@ -312,7 +360,7 @@ export class GeminiLiveSession {
               ],
             },
           ],
-          turnComplete: true,
+          turnComplete: opts?.generate === true,
         },
       })
     );

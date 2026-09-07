@@ -6,6 +6,8 @@ import { WebSocketServer } from "ws";
 import { prisma } from "./db.js";
 import { handleTwilioMediaStream } from "./twilio-stream-handler.js";
 import { getLiveModel, resolveGeminiLiveVoice } from "./config.js";
+import { resolveVoiceTtsProvider } from "./tts/tts-provider.js";
+import { loadDeepgramTtsConfig } from "./tts/deepgram-tts.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Load repo-root env files when present (local). Render injects env vars directly.
@@ -42,6 +44,8 @@ function healthPayload() {
     geminiConfigured: geminiKey,
     geminiLiveModel: getLiveModel(),
     geminiLiveVoice: resolveGeminiLiveVoice(),
+    ttsProvider: resolveVoiceTtsProvider(),
+    deepgramConfigured: Boolean(loadDeepgramTtsConfig()),
     twilioConfigured: twilioOk,
     appUrlConfigured: appUrl,
     environment: process.env.NODE_ENV || "development",

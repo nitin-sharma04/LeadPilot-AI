@@ -18,7 +18,8 @@
     "smoke:production": "tsx scripts/production-smoke-test.ts",
     "voice:dev": "npm --prefix voice-server run dev",
     "voice:start": "npm --prefix voice-server run start",
-    "voice:typecheck": "npm --prefix voice-server run typecheck"
+    "voice:typecheck": "npm --prefix voice-server run typecheck",
+    "test:deepgram-tts": "tsx --env-file=.env.local scripts/test-deepgram-tts.ts"
   },
   "engines": {
     "node": ">=20 <23"

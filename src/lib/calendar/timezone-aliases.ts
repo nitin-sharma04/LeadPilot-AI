@@ -5,7 +5,7 @@
 
 export const TIMEZONE_ALIASES: Array<{ re: RegExp; iana: string }> = [
   {
-    re: /\b(ist|india(?:n)?\s+standard\s+time|india(?:n)?\s+time\s+standard|india\s+time)\b/i,
+    re: /\b(ist|india(?:n)?\s+standard\s+time|india(?:n)?\s+time\s+standard|india(?:n)?\s+time)\b/i,
     iana: "Asia/Kolkata",
   },
   { re: /\b(pkt|pakistan\s+standard\s+time)\b/i, iana: "Asia/Karachi" },

@@ -12,6 +12,7 @@
     "postinstall": "node ./scripts/ensure-prisma.cjs"
   },
   "dependencies": {
+    "@deepgram/sdk": "^5.10.0",
     "@prisma/client": "6.19.3",
     "dotenv": "^16.4.7",
     "prisma": "6.19.3",

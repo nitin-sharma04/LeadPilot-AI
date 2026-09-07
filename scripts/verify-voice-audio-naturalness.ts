@@ -170,7 +170,7 @@ assert(upsample8kTo16k(new Int16Array(160)).length === 320, "upsample 8→16");
   assert(gemini.includes("[INTERNAL]"), "internal notify");
   assert(!gemini.includes("Greet them warmly by name if known"), "no long coaching in opening");
   assert(gemini.includes("prebuiltVoiceConfig"), "voice config");
-  assert(gemini.includes("silenceDurationMs: 950"), "VAD 950");
+  assert(gemini.includes("silenceDurationMs: this.vadSilenceMs"), "VAD configurable");
   assert(gemini.includes("voiceName: this.voice"), "voice passed");
 }
 

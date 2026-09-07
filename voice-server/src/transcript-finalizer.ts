@@ -1,12 +1,15 @@
 import {
-  markUnclearIfEmpty,
+  finalizeLeadUtterance,
+  isInternalTranscript,
+  mergeStreamingTranscript,
   normalizeTranscriptText,
   shouldSkipDuplicate,
 } from "./transcript-cleanup.js";
 import { appendTranscript } from "./db.js";
 
 /**
- * Buffers interim STT and only persists finalized utterances.
+ * Buffers interim STT and only persists finalized user-facing utterances.
+ * Internal events and empty/interim-only turns never become transcript rows.
  */
 export class TranscriptFinalizer {
   private leadBuf = "";
@@ -17,7 +20,12 @@ export class TranscriptFinalizer {
 
   constructor(private readonly callId: string) {}
 
+  peekAgent(): string {
+    return this.agentBuf.trim();
+  }
+
   setInterimLead(text: string) {
+    if (isInternalTranscript(text)) return;
     this.interimLead = text;
   }
 
@@ -25,26 +33,16 @@ export class TranscriptFinalizer {
   appendLead(text: string) {
     const chunk = text.trim();
     if (!chunk) return;
-    // If cumulative (new starts with old), replace; else append.
-    if (this.leadBuf && chunk.startsWith(this.leadBuf.trim())) {
-      this.leadBuf = chunk;
-    } else if (this.leadBuf && this.leadBuf.includes(chunk)) {
-      return;
-    } else {
-      this.leadBuf = `${this.leadBuf} ${chunk}`.trim();
-    }
+    if (isInternalTranscript(chunk)) return;
+    if (chunk === "[unclear]") return;
+    this.leadBuf = mergeStreamingTranscript(this.leadBuf, chunk);
   }
 
   appendAgent(text: string) {
     const chunk = text.trim();
     if (!chunk) return;
-    if (this.agentBuf && chunk.startsWith(this.agentBuf.trim())) {
-      this.agentBuf = chunk;
-    } else if (this.agentBuf && this.agentBuf.includes(chunk)) {
-      return;
-    } else {
-      this.agentBuf = `${this.agentBuf} ${chunk}`.trim();
-    }
+    if (isInternalTranscript(chunk)) return;
+    this.agentBuf = mergeStreamingTranscript(this.agentBuf, chunk);
   }
 
   /** Drop incomplete agent speech after barge-in. */
@@ -53,12 +51,11 @@ export class TranscriptFinalizer {
   }
 
   async flushLead(): Promise<string | null> {
-    const raw = this.leadBuf || this.interimLead;
+    const raw = this.leadBuf.trim() || this.interimLead.trim();
     this.leadBuf = "";
     this.interimLead = "";
-    let text = normalizeTranscriptText(raw);
-    text = markUnclearIfEmpty(text);
-    if (shouldSkipDuplicate(this.lastLead, text)) return null;
+    const text = finalizeLeadUtterance(raw, this.lastLead);
+    if (!text) return null;
     this.lastLead = text;
     await appendTranscript({
       callId: this.callId,
@@ -72,8 +69,9 @@ export class TranscriptFinalizer {
     const raw = this.agentBuf;
     this.agentBuf = "";
     if (!raw.trim()) return null;
+    if (isInternalTranscript(raw)) return null;
     const text = normalizeTranscriptText(raw);
-    if (!text) return null;
+    if (!text || isInternalTranscript(text)) return null;
     if (shouldSkipDuplicate(this.lastAgent, text)) return null;
     this.lastAgent = text;
     await appendTranscript({
@@ -82,6 +80,24 @@ export class TranscriptFinalizer {
       message: text,
     });
     return text;
+  }
+
+  /**
+   * Persist the exact Deepgram/spoken agent text (authoritative),
+   * replacing any buffered Gemini output for this turn.
+   */
+  async persistSpokenAgent(text: string): Promise<string | null> {
+    this.agentBuf = "";
+    const cleaned = normalizeTranscriptText(text);
+    if (!cleaned || isInternalTranscript(cleaned)) return null;
+    if (shouldSkipDuplicate(this.lastAgent, cleaned)) return null;
+    this.lastAgent = cleaned;
+    await appendTranscript({
+      callId: this.callId,
+      speaker: "AI",
+      message: cleaned,
+    });
+    return cleaned;
   }
 
   async flushAll() {

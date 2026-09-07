@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { resolveCustomVocabulary } from "./config.js";
 import { REALTIME_HUMAN_SDR_PROMPT } from "./prompts.js";
+import { isInternalTranscript } from "./transcript-cleanup.js";
 
 export const prisma = new PrismaClient();
 
@@ -31,6 +32,7 @@ export async function appendTranscript(input: {
 }) {
   const text = input.message.trim();
   if (!text) return;
+  if (isInternalTranscript(text)) return;
   await prisma.callTranscript.create({
     data: {
       callId: input.callId,
@@ -46,10 +48,9 @@ export async function noteCallEndReason(input: {
   reason: string;
 }) {
   try {
-    await appendTranscript({
+    console.info("[voice-server] call end requested", {
       callId: input.callId,
-      speaker: "AI",
-      message: `[system] Call end requested: ${input.reason.slice(0, 80)}`,
+      reason: input.reason.slice(0, 80),
     });
   } catch {
     /* ignore — hangup must not depend on this */
