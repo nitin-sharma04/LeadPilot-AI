@@ -75,6 +75,19 @@ export function validateEnvironment(options?: {
         message: "DEMO_MODE is enabled in production — demo login will be available",
       });
     }
+    for (const key of [
+      "GOOGLE_REDIRECT_URI",
+      "GOOGLE_GMAIL_REDIRECT_URI",
+      "HUBSPOT_REDIRECT_URI",
+    ] as const) {
+      const value = process.env[key]?.trim() || "";
+      if (value && /localhost|127\.0\.0\.1/i.test(value)) {
+        warnings.push({
+          key,
+          message: `${key} points at localhost — production OAuth will use APP_URL instead`,
+        });
+      }
+    }
   }
 
   // AI

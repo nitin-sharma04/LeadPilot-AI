@@ -8,7 +8,7 @@
  */
 
 import { AppError } from "@/lib/errors";
-import { getAppUrl } from "@/lib/app-url";
+import { resolveOAuthRedirectUri } from "@/lib/app-url";
 
 export const GOOGLE_CALENDAR_SCOPES = [
   "https://www.googleapis.com/auth/calendar.events",
@@ -45,9 +45,10 @@ export function getGoogleOAuthConfig() {
   const clientSecret =
     process.env.GOOGLE_CLIENT_SECRET?.trim() ||
     (demo ? DEMO_GOOGLE_CLIENT_SECRET : "");
-  const redirectUri =
-    process.env.GOOGLE_REDIRECT_URI?.trim() ||
-    `${getAppUrl()}/api/integrations/google-calendar/callback`;
+  const redirectUri = resolveOAuthRedirectUri(
+    process.env.GOOGLE_REDIRECT_URI,
+    "/api/integrations/google-calendar/callback"
+  );
 
   if (!clientId || !clientSecret) {
     throw new AppError(

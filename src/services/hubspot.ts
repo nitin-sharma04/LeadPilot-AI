@@ -7,7 +7,7 @@
 import { CrmConnectionStatus, CrmProvider, LeadSource } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { AppError } from "@/lib/errors";
-import { getAppUrl } from "@/lib/app-url";
+import { resolveOAuthRedirectUri } from "@/lib/app-url";
 import { createLeadRecord } from "@/services/leads";
 import { signGoogleOAuthState, verifySignedState } from "@/lib/calendar/google-oauth-state";
 
@@ -27,9 +27,9 @@ export function isHubSpotConfigured() {
 }
 
 function hubspotRedirectUri() {
-  return (
-    process.env.HUBSPOT_REDIRECT_URI?.trim() ||
-    `${getAppUrl()}/api/integrations/hubspot/callback`
+  return resolveOAuthRedirectUri(
+    process.env.HUBSPOT_REDIRECT_URI,
+    "/api/integrations/hubspot/callback"
   );
 }
 

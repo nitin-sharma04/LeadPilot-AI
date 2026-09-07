@@ -5,7 +5,7 @@
  */
 
 import { AppError } from "@/lib/errors";
-import { getAppUrl } from "@/lib/app-url";
+import { resolveOAuthRedirectUri } from "@/lib/app-url";
 import {
   DEMO_GOOGLE_CLIENT_ID,
   DEMO_GOOGLE_CLIENT_SECRET,
@@ -37,9 +37,10 @@ export function getGmailOAuthConfig() {
   const clientSecret =
     process.env.GOOGLE_CLIENT_SECRET?.trim() ||
     (demo ? DEMO_GOOGLE_CLIENT_SECRET : "");
-  const redirectUri =
-    process.env.GOOGLE_GMAIL_REDIRECT_URI?.trim() ||
-    `${getAppUrl()}/api/integrations/gmail/callback`;
+  const redirectUri = resolveOAuthRedirectUri(
+    process.env.GOOGLE_GMAIL_REDIRECT_URI,
+    "/api/integrations/gmail/callback"
+  );
 
   if (!clientId || !clientSecret) {
     throw new AppError(
