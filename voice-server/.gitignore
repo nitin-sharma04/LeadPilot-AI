@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.generated.schema.prisma
+.env
+.env.local
+*.log

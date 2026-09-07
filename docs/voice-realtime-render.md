@@ -1,71 +1,68 @@
-# Realtime voice on Render (Gemini Live)
+# leadpilot-voice (Render) — production deploy
 
-## Root cause (why calls were turn-based)
+Independent Web Service for Twilio Media Streams ↔ Gemini Live.
 
-Production stamped `voiceMode=turn_based` because:
+## Exact Render settings
 
-1. `VOICE_STREAM_URL` pointed at an ephemeral Cloudflare/ngrok tunnel, **or**
-2. `VOICE_STREAM_URL` was unset on the Next.js service, **or**
-3. The voice-server WebSocket service was not deployed / not reachable
+| Setting | Value |
+|---------|--------|
+| **Name** | `leadpilot-voice` |
+| **Root Directory** | `voice-server` |
+| **Runtime** | Node |
+| **Build Command** | `npm ci && npm run build` |
+| **Start Command** | `npm start` |
+| **Health Check Path** | `/health` |
 
-`resolveEffectiveVoiceMode()` intentionally rejects trycloudflare/ngrok URLs when `NODE_ENV=production` unless `VOICE_ALLOW_TUNNEL=true`.
+The process binds to `0.0.0.0` and `process.env.PORT` (Render injects `PORT`).
 
-## Target architecture
+## Required environment variables (names only)
 
-```
-Phone
-  → Twilio Programmable Voice
-  → Media Stream (WSS)
-  → Render: leadpilot-voice (/media-stream)
-  → Gemini Live (bidirectional audio)
-  → Twilio → Phone
+Set these in the Render dashboard (never commit secret values):
 
-Render: leadpilot-web (Next.js + Auth + Prisma APIs)
-Supabase: PostgreSQL
-```
+| Name | Notes |
+|------|--------|
+| `DATABASE_URL` | Same Supabase Postgres URL the Next.js app uses (pooler OK for runtime reads/writes) |
+| `GEMINI_API_KEY` | Server-side only |
+| `GEMINI_LIVE_MODEL` | e.g. `gemini-3.1-flash-live-preview` |
+| `GEMINI_LIVE_VOICE` | e.g. `Aoede` (optional if defaulted in dashboard) |
+| `TWILIO_ACCOUNT_SID` | For REST hangup |
+| `TWILIO_AUTH_TOKEN` | For REST hangup |
+| `APP_URL` | Public Next.js origin, e.g. `https://leadpilot-ai-mnyw.onrender.com` |
+| `VOICE_MAX_CALL_DURATION_SECONDS` | e.g. `600` |
+| `NODE_ENV` | `production` |
+| `PORT` | Injected by Render — do not set manually unless required |
 
-Turn-based Gather remains the automatic fallback when realtime prerequisites are missing.
+## Prisma
 
-## Deploy voice-server
+- Uses the **existing** monorepo schema at `../prisma/schema.prisma` (Render clones the full repo even with `rootDir: voice-server`).
+- Build copies that schema to a temp file under `voice-server/` and runs `prisma generate` so the client is written into **this** service’s `node_modules` (not a parent Next.js install).
+- No second schema in git, no second database, no migrations from this service.
+- `DIRECT_URL` is **not** required on the voice service (runtime uses `DATABASE_URL` only).
 
-1. Create/update Render Web Service **leadpilot-voice** (see `render.yaml`).
-2. Build from repo root:
-   - Build: `npm ci && npx prisma generate && npm --prefix voice-server ci`
-   - Start: `npm --prefix voice-server run start`
-   - Health: `/health`
-3. Set env on **leadpilot-voice**:
-   - `DATABASE_URL` (same Supabase pooler URL as web)
-   - `GEMINI_API_KEY`
-   - `GEMINI_LIVE_MODEL` (e.g. `gemini-3.1-flash-live-preview`)
-   - `GEMINI_LIVE_VOICE=Aoede`
-   - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` (for REST hangup)
-   - `APP_URL=https://leadpilot-ai-mnyw.onrender.com`
-   - `VOICE_MAX_CALL_DURATION_SECONDS=600`
+## After voice is live — wire the Next.js app
 
-4. After deploy, open `https://<voice-host>/health` — expect `"status":"ok"`.
-
-## Wire Next.js to realtime
-
-On **leadpilot-web** set:
+On **leadpilot-web**:
 
 ```
 VOICE_MODE=realtime
-VOICE_STREAM_URL=wss://<voice-host>/media-stream
-VOICE_WEBHOOK_BASE_URL=https://leadpilot-ai-mnyw.onrender.com
-GEMINI_API_KEY=...
-GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview
+VOICE_STREAM_URL=wss://<leadpilot-voice-host>/media-stream
 ```
 
-Do **not** use trycloudflare/ngrok for production.
+Do **not** use Cloudflare/ngrok tunnels in production.
 
 ## Verify
 
-1. `GET /api/health` on the web app → `voice.effectiveMode` should be `"realtime"`, `voice.voiceServerHealth` `"ok"`.
-2. Start an AI call from a lead.
-3. UI badge should say **Realtime (Gemini Live)** / **Realtime AI active**.
-4. Logs should **not** contain `[voice] realtime unavailable; using turn_based`.
-5. Confirm barge-in, booking, hangup, transcript, and summary still work.
+```bash
+# From voice-server/
+npm ci
+npm run typecheck
+npm run build
 
-## Fallback
+# From repo root
+npm run smoke:production
+npx tsc --noEmit
+npm run lint
+npm run build
+```
 
-If realtime cannot start, the web app stamps `turn_based` and uses Gather + fast Gemini text. That path is intentional and logged with `fallbackReason`.
+Then open `https://<leadpilot-voice-host>/health` and confirm `"status":"ok"`.

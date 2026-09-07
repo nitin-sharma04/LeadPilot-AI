@@ -51,28 +51,30 @@ services:
     name: leadpilot-voice
     runtime: node
     plan: starter
-    # Build from monorepo root so Prisma schema + client resolve correctly
-    buildCommand: npm ci && npx prisma generate && npm --prefix voice-server ci
-    startCommand: npm --prefix voice-server run start
+    rootDir: voice-server
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION
         value: "20.19.0"
+      - key: VOICE_MAX_CALL_DURATION_SECONDS
+        value: "600"
+      - key: GEMINI_LIVE_VOICE
+        value: Aoede
+      # Set secrets in the Render dashboard (do not commit values):
       - key: DATABASE_URL
         sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_LIVE_MODEL
         sync: false
-      - key: GEMINI_LIVE_VOICE
-        value: Aoede
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
         sync: false
       - key: APP_URL
         sync: false
-      - key: VOICE_MAX_CALL_DURATION_SECONDS
-        value: "600"
+      # PORT is injected by Render automatically; do not hardcode.

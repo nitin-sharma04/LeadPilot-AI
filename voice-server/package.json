@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc --noEmit",
+    "prisma:generate": "node ./scripts/ensure-prisma.cjs",
+    "build": "npm run prisma:generate && tsc --noEmit",
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "postinstall": "node ./scripts/ensure-prisma.cjs"
@@ -13,13 +14,13 @@
   "dependencies": {
     "@prisma/client": "6.19.3",
     "dotenv": "^16.4.7",
+    "prisma": "6.19.3",
+    "tsx": "^4.23.13",
     "ws": "^8.18.1"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
     "@types/ws": "^8.18.1",
-    "prisma": "6.19.3",
-    "tsx": "^4.23.13",
     "typescript": "^5.9.3"
   },
   "engines": {
