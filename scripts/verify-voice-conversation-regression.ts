@@ -196,12 +196,13 @@ assert(resolveGeminiLiveVoice() === "Aoede" || resolveGeminiLiveVoice("Aoede") =
 {
   const prevVad = process.env.GEMINI_VAD_SILENCE_MS;
   delete process.env.GEMINI_VAD_SILENCE_MS;
-  assert(getVadSilenceMs() === 500, "VAD default 500");
+  assert(getVadSilenceMs() === 900, "VAD default 900");
   if (prevVad !== undefined) process.env.GEMINI_VAD_SILENCE_MS = prevVad;
 }
 assert(getVadSilenceMs("700") === 700, "VAD 700");
+assert(getVadSilenceMs("950") === 950, "VAD 950 allowed");
 assert(getVadSilenceMs("300") === 400, "VAD clamp min");
-assert(getVadSilenceMs("2000") === 750, "VAD clamp max");
+assert(getVadSilenceMs("2000") === 1200, "VAD clamp max");
 
 // --- Barge-in still present ---
 {

@@ -64,15 +64,15 @@ export function getMaxCallDurationSeconds(): number {
 }
 
 /**
- * Gemini Live end-of-speech silence (ms). Default 500.
- * Clamp 400–750: snappy turn-taking without cutting normal pauses.
+ * Gemini Live end-of-speech silence (ms). Default 900.
+ * Clamp 400–1200: finish natural pauses without adding a response sleep.
  */
 export function getVadSilenceMs(
   value: string | undefined = process.env.GEMINI_VAD_SILENCE_MS
 ): number {
-  const raw = Number.parseInt(value || "500", 10);
-  if (!Number.isFinite(raw)) return 500;
-  return Math.min(750, Math.max(400, raw));
+  const raw = Number.parseInt(value || "900", 10);
+  if (!Number.isFinite(raw)) return 900;
+  return Math.min(1200, Math.max(400, raw));
 }
 
 export function isVoiceLatencyDebugEnabled(): boolean {

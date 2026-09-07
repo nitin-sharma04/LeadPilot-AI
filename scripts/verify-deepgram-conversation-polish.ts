@@ -46,12 +46,14 @@ const gemini = readFileSync(
 {
   const prev = process.env.GEMINI_VAD_SILENCE_MS;
   delete process.env.GEMINI_VAD_SILENCE_MS;
-  assert(getVadSilenceMs() === 500, "default VAD 500");
+  assert(getVadSilenceMs() === 900, "default VAD 900");
   if (prev !== undefined) process.env.GEMINI_VAD_SILENCE_MS = prev;
   assert(getVadSilenceMs("500") === 500, "500 allowed");
   assert(getVadSilenceMs("650") === 650, "650 allowed");
   assert(getVadSilenceMs("700") === 700, "700 allowed");
   assert(getVadSilenceMs("750") === 750, "750 allowed");
+  assert(getVadSilenceMs("950") === 950, "950 allowed");
+  assert(getVadSilenceMs("2000") === 1200, "clamp max 1200");
   assert(gemini.includes("silenceDurationMs: this.vadSilenceMs"), "live uses config");
   assert(gemini.includes("END_SENSITIVITY_HIGH"), "faster end-of-speech");
 }

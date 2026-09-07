@@ -24,6 +24,10 @@ export class TranscriptFinalizer {
     return this.agentBuf.trim();
   }
 
+  peekLead(): string {
+    return (this.leadBuf.trim() || this.interimLead.trim());
+  }
+
   setInterimLead(text: string) {
     if (isInternalTranscript(text)) return;
     this.interimLead = text;

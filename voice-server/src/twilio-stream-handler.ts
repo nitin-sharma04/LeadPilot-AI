@@ -18,7 +18,6 @@ import {
   detectsAgentFarewell,
   detectsEndCallIntent,
   detectsForceHangupIntent,
-  isUnclearUtterance,
 } from "./end-call-intent.js";
 import { GeminiLiveSession } from "./gemini-live.js";
 import { OutboundMulawFrameBuffer } from "./outbound-mulaw-buffer.js";
@@ -47,6 +46,10 @@ import {
   emptyVoiceLatencyMarks,
   logVoiceLatency,
 } from "./voice-latency.js";
+import {
+  isFinalizedLeadTranscript,
+  VoiceTurnController,
+} from "./voice-turn-state.js";
 
 type TwilioEvent = {
   event?: string;
@@ -89,14 +92,30 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   let deepgramSession: DeepgramTtsSession | null = null;
   let lastDeepgramSpoken: string | null = null;
   let deepgramTurnInFlight = false;
+  let ttsEpoch = 0;
   let skipNextAgentSpeak = false;
   let leadSpokeAfterBooking = false;
   let agentSpokenThisTurn = false;
   let latency = emptyVoiceLatencyMarks();
+  const turns = new VoiceTurnController();
+
+  const logVoiceTurn = (input: {
+    turnId: number;
+    leadText: string | null;
+    responseStarted: boolean;
+    reason: string;
+  }) => {
+    console.info("[voice-turn]", {
+      callId,
+      turnId: input.turnId,
+      leadText: input.leadText,
+      responseStarted: input.responseStarted,
+      reason: input.reason,
+    });
+  };
 
   const tryBookOnLeadConfirmation = async (leadText: string) => {
     if (!callId || !streamToken || !gemini) return;
-    apptTracker.noteLead(leadText);
     if (!apptTracker.shouldAttemptBooking(leadText)) return;
 
     apptTracker.markBookingAttempted();
@@ -214,6 +233,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   };
 
   const cancelDeepgramTts = () => {
+    ttsEpoch += 1;
     deepgramSession?.interrupt();
     deepgramTurnInFlight = false;
   };
@@ -229,7 +249,10 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
    * Speak one finalized Gemini transcript via Deepgram µ-law.
    * Does not fall back to Gemini native audio mid-turn (that audio was dropped).
    */
-  const speakDeepgramTurn = async (agentText: string): Promise<boolean> => {
+  const speakDeepgramTurn = async (
+    agentText: string,
+    opts?: { replace?: boolean }
+  ): Promise<boolean> => {
     const speakable = toSpeakableAgentText(agentText);
     if (!speakable) return false;
     if (shouldSkipDuplicateSynthesis(lastDeepgramSpoken, speakable)) return false;
@@ -241,18 +264,47 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       return false;
     }
 
-    const cfg = loadDeepgramTtsConfig();
-    if (!cfg) {
-      console.error("[deepgram-tts] missing config; turn audio skipped");
+    if (!opts?.replace && deepgramTurnInFlight) {
+      logVoiceTurn({
+        turnId: turns.currentLeadTurnId,
+        leadText: turns.lastFinalizedLead,
+        responseStarted: false,
+        reason: "tts_duplicate_ignored",
+      });
       return false;
     }
 
-    deepgramSession?.interrupt();
+    const ttsGate = opts?.replace
+      ? turns.beginReplacementTts()
+      : turns.tryBeginTts();
+    if (!ttsGate.accepted) {
+      logVoiceTurn({
+        turnId: ttsGate.turnId,
+        leadText: turns.lastFinalizedLead,
+        responseStarted: false,
+        reason: ttsGate.reason,
+      });
+      return false;
+    }
+    if (opts?.replace && deepgramTurnInFlight) {
+      deepgramSession?.interrupt();
+      deepgramTurnInFlight = false;
+    }
+
+    const cfg = loadDeepgramTtsConfig();
+    if (!cfg) {
+      console.error("[deepgram-tts] missing config; turn audio skipped");
+      turns.endTts();
+      return false;
+    }
+
     if (!deepgramSession) {
       deepgramSession = new DeepgramTtsSession(cfg);
       void deepgramSession.warmup();
     }
     const session = deepgramSession;
+    ttsEpoch += 1;
+    const myEpoch = ttsEpoch;
     deepgramTurnInFlight = true;
     lastDeepgramSpoken = speakable;
     latency.deepgramFirstAudioAt = null;
@@ -305,8 +357,9 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       });
       return false;
     } finally {
-      if (deepgramSession === session) {
+      if (myEpoch === ttsEpoch) {
         deepgramTurnInFlight = false;
+        turns.endTts();
       }
     }
   };
@@ -322,9 +375,10 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     agentSpokenThisTurn = true;
     agentTurnCount += 1;
     apptTracker.noteAgent(prepared);
+    turns.noteAgentSpoken(prepared);
     void finalizer?.persistSpokenAgent(prepared);
     if (ttsProvider === "deepgram") {
-      return speakDeepgramTurn(prepared);
+      return speakDeepgramTurn(prepared, { replace: true });
     }
     // Gemini native audio path: prepared text is already persisted; Live speaks it.
     gemini?.notifySystem(
@@ -362,11 +416,74 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     agentSpokenThisTurn = true;
     agentTurnCount += 1;
     apptTracker.noteAgent(prepared);
+    turns.noteAgentSpoken(prepared);
     void finalizer?.persistSpokenAgent(prepared);
     if (ttsProvider === "deepgram") {
       await speakDeepgramTurn(prepared);
     }
     return prepared;
+  };
+
+  const processFinalLeadTurn = (rawText: string) => {
+    if (endController?.isEnding) return;
+    const leadText = rawText.replace(/\s+/g, " ").trim();
+    const finalized = turns.finalizeLeadTurn(leadText);
+    if (!finalized.accepted) {
+      logVoiceTurn({
+        turnId: finalized.turnId,
+        leadText: turns.lastFinalizedLead,
+        responseStarted: false,
+        reason: finalized.reason,
+      });
+      return;
+    }
+
+    agentSpokenThisTurn = false;
+    latency = emptyVoiceLatencyMarks();
+    latency.leadFinalAt = Date.now();
+    if (apptTracker.hasBooked) leadSpokeAfterBooking = true;
+
+    logVoiceTurn({
+      turnId: finalized.turnId,
+      leadText: turns.lastFinalizedLead,
+      responseStarted: false,
+      reason: "lead_finalized",
+    });
+
+    if (detectsSlowSpeechRequest(leadText) && speechPace !== "slow") {
+      speechPace = "slow";
+      console.info("[voice-server] speechPace=slow", { callId });
+      gemini?.notifySystem(slowSpeechSystemNudge(), { generate: false });
+    }
+
+    apptTracker.noteLead(leadText);
+    void tryBookOnLeadConfirmation(leadText);
+    void finalizer?.flushLead();
+
+    if (detectsEndCallIntent(leadText)) {
+      if (apptTracker.isFlowActive && !apptTracker.hasBooked) {
+        const hint =
+          apptTracker.coachingHint() ||
+          "[INTERNAL] appt=continue. Meeting is not goodbye.";
+        gemini?.notifySystem(hint, { generate: false });
+        return;
+      }
+      const force = detectsForceHangupIntent(leadText);
+      beginEndFlow({
+        reason: force ? "lead_force_hangup" : "lead_hangup",
+        awaitFarewellDelivery: true,
+        sendClosingPrompt: true,
+      });
+      return;
+    }
+
+    if (apptTracker.isFlowActive) {
+      const hint = apptTracker.coachingHint();
+      if (hint && hint !== lastCoachingHint) {
+        lastCoachingHint = hint;
+        gemini?.notifySystem(hint, { generate: false });
+      }
+    }
   };
 
   const teardownMedia = () => {
@@ -386,11 +503,11 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     gemini = null;
   };
 
-  const beginEndFlow = (input: {
+  function beginEndFlow(input: {
     reason: "lead_hangup" | "lead_force_hangup" | "agent_farewell" | "max_duration";
     awaitFarewellDelivery: boolean;
     sendClosingPrompt: boolean;
-  }) => {
+  }) {
     if (!endController) return;
     const { accepted } = endController.requestEnd({
       reason: input.reason,
@@ -408,6 +525,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
 
     if (input.sendClosingPrompt && !closingPromptSent) {
       closingPromptSent = true;
+      turns.allowClosingResponse();
       gemini?.requestClosing();
       // If closing generation never completes, still terminate (cost protection).
       setTimeout(() => {
@@ -433,7 +551,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     if (!input.awaitFarewellDelivery) {
       /* requestEnd already started hangup */
     }
-  };
+  }
 
   twilioWs.on("message", async (raw) => {
     let msg: TwilioEvent;
@@ -620,9 +738,15 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             },
             onInterrupted: () => {
               if (endController?.isEnding) return;
-              console.info("[voice-server] barge-in", { callId, ttsProvider });
+              const barge = turns.onBargeIn();
+              console.info("[voice-server] barge-in", {
+                callId,
+                ttsProvider,
+                cancelTts: barge.cancelTts,
+              });
               clearOutboundAudio();
               finalizer?.discardAgentBuffer();
+              lastDeepgramSpoken = null;
               agentSpokenThisTurn = false;
               skipNextAgentSpeak = false;
               latency = emptyVoiceLatencyMarks();
@@ -631,42 +755,31 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
               if (endController?.isEnding) return;
               finalizer?.setInterimLead(text);
             },
-            onInputTranscript: (text) => {
+            onInputTranscript: (text, meta) => {
               if (endController?.isEnding) return;
-              if (agentSpokenThisTurn) {
-                agentSpokenThisTurn = false;
-                latency = emptyVoiceLatencyMarks();
-              }
-              latency.leadFinalAt = Date.now();
               finalizer?.appendLead(text);
-              if (apptTracker.hasBooked) leadSpokeAfterBooking = true;
-              if (detectsSlowSpeechRequest(text) && speechPace !== "slow") {
-                speechPace = "slow";
-                console.info("[voice-server] speechPace=slow", { callId });
-              }
-              apptTracker.noteLead(text);
-              void tryBookOnLeadConfirmation(text);
+              if (!isFinalizedLeadTranscript(meta)) return;
+              processFinalLeadTurn(finalizer?.peekLead() || text);
             },
-            onOutputTranscript: (text, meta) => {
+            onOutputTranscript: (text) => {
               finalizer?.appendAgent(text);
-              apptTracker.noteAgent(text);
-              if (
-                ttsProvider === "deepgram" &&
-                meta?.finished &&
-                !endController?.isEnding
-              ) {
-                void prepareAndSpeakGeminiTurn(finalizer?.peekAgent() || null);
-              }
             },
             onGenerationComplete: () => {
               void (async () => {
                 if (ttsProvider === "deepgram") {
-                  if (endController?.isEnding) return;
+                  if (endController?.isEnding && skipNextAgentSpeak) return;
+                  const gate = turns.tryAcceptModelResponse("generation_complete");
+                  logVoiceTurn({
+                    turnId: gate.turnId,
+                    leadText: turns.lastFinalizedLead,
+                    responseStarted: gate.accepted,
+                    reason: gate.reason,
+                  });
+                  if (!gate.accepted) return;
                   const peeked = finalizer?.peekAgent() || null;
                   await prepareAndSpeakGeminiTurn(peeked);
                   return;
                 }
-                // Finish any partial telephony frames for this model turn.
                 flushOutbound({
                   sendFarewellMark: Boolean(endController?.isEnding),
                 });
@@ -680,12 +793,23 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 latency.geminiTurnCompleteAt = Date.now();
                 if (endController?.isEnding) {
                   await finalizer?.flushLead();
-                  const endingPeek = finalizer?.peekAgent() || null;
-                  const endingAgent =
-                    (await prepareAndSpeakGeminiTurn(endingPeek)) ||
-                    (await finalizer?.flushAgent());
-                  if (ttsProvider === "deepgram" && endingAgent) {
-                    /* already spoken in prepareAndSpeakGeminiTurn */
+                  if (ttsProvider === "deepgram") {
+                    const endingGate = turns.tryAcceptModelResponse(
+                      "turn_complete_ending"
+                    );
+                    if (endingGate.accepted) {
+                      logVoiceTurn({
+                        turnId: endingGate.turnId,
+                        leadText: turns.lastFinalizedLead,
+                        responseStarted: true,
+                        reason: endingGate.reason,
+                      });
+                      await prepareAndSpeakGeminiTurn(
+                        finalizer?.peekAgent() || null
+                      );
+                    }
+                  } else {
+                    await finalizer?.flushAgent();
                   }
                   flushOutbound({ sendFarewellMark: true });
                   endController.notifyFarewellEnqueued(lastMarkName);
@@ -696,13 +820,33 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                   flushOutbound();
                 }
 
-                const peeked = finalizer?.peekAgent() || null;
-                const [agentText, leadUtterance] = await Promise.all([
-                  prepareAndSpeakGeminiTurn(peeked),
-                  finalizer?.flushLead() ?? Promise.resolve(null),
-                ]);
-                const spoken = agentText;
+                if (ttsProvider === "deepgram") {
+                  const fallback = turns.tryAcceptModelResponse(
+                    "turn_complete_fallback"
+                  );
+                  if (fallback.accepted) {
+                    logVoiceTurn({
+                      turnId: fallback.turnId,
+                      leadText: turns.lastFinalizedLead,
+                      responseStarted: true,
+                      reason: fallback.reason,
+                    });
+                    await prepareAndSpeakGeminiTurn(
+                      finalizer?.peekAgent() || null
+                    );
+                  } else {
+                    logVoiceTurn({
+                      turnId: fallback.turnId,
+                      leadText: turns.lastFinalizedLead,
+                      responseStarted: false,
+                      reason: fallback.reason,
+                    });
+                  }
+                } else {
+                  await finalizer?.flushAgent();
+                }
 
+                const spoken = turns.lastFinalizedAgent;
                 if (
                   spoken &&
                   agentTurnCount >= 2 &&
@@ -723,39 +867,6 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                     awaitFarewellDelivery: true,
                     sendClosingPrompt: false,
                   });
-                  return;
-                }
-
-                if (!leadUtterance) return;
-                if (isUnclearUtterance(leadUtterance)) return;
-
-                await tryBookOnLeadConfirmation(leadUtterance);
-
-                if (detectsSlowSpeechRequest(leadUtterance) && speechPace !== "slow") {
-                  speechPace = "slow";
-                  gemini?.notifySystem(slowSpeechSystemNudge(), { generate: false });
-                }
-
-                if (detectsEndCallIntent(leadUtterance)) {
-                  if (apptTracker.isFlowActive && !apptTracker.hasBooked) {
-                    const hint =
-                      apptTracker.coachingHint() ||
-                      "[INTERNAL] appt=continue. Meeting is not goodbye.";
-                    gemini?.notifySystem(hint, { generate: false });
-                    return;
-                  }
-                  const force = detectsForceHangupIntent(leadUtterance);
-                  beginEndFlow({
-                    reason: force ? "lead_force_hangup" : "lead_hangup",
-                    awaitFarewellDelivery: true,
-                    sendClosingPrompt: true,
-                  });
-                } else if (apptTracker.isFlowActive) {
-                  const hint = apptTracker.coachingHint();
-                  if (hint && hint !== lastCoachingHint) {
-                    lastCoachingHint = hint;
-                    gemini?.notifySystem(hint, { generate: false });
-                  }
                 }
               })();
             },
