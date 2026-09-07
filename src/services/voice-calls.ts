@@ -18,7 +18,6 @@ import {
 } from "@/lib/voice/mode";
 import {
   generateCallSummary,
-  generateVoiceOpening,
   generateVoiceTurn,
 } from "@/lib/ai/voice-agent";
 import type { VoiceAgentLeadContext } from "@/lib/ai/prompts/voice-agent";
@@ -26,7 +25,32 @@ import { normalizeTranscriptText } from "@/lib/voice/transcript-cleanup";
 
 const inFlight = new Set<string>();
 const lastCallAt = new Map<string, number>();
+const finalizingCalls = new Set<string>();
 const COOLDOWN_MS = 60_000;
+/** Twilio must get TwiML back well under ~15s or it plays "an application error has occurred". */
+const VOICE_AI_DEADLINE_MS = 10_000;
+
+function defaultOpening(lead: VoiceAgentLeadContext): string {
+  const first = lead.name.split(" ")[0] || "there";
+  return `Hi ${first}, this is ${lead.agentName}, an AI assistant calling from ${lead.sellerCompanyName}. Do you have a quick moment to chat about your recent interest?`;
+}
+
+async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`voice AI deadline exceeded (${ms}ms)`)),
+          ms
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 const ACTIVE_STATUSES: CallStatus[] = [
   CallStatus.INITIATING,
   CallStatus.RINGING,
@@ -454,14 +478,10 @@ export async function handleTwilioAnswer(callId: string): Promise<string> {
     });
   }
 
-  // Phase 5A turn-based fallback
-  let opening: string;
-  try {
-    const turn = await generateVoiceOpening(lead);
-    opening = turn.reply;
-  } catch {
-    opening = `Hi ${lead.name.split(" ")[0]}, this is ${lead.agentName}, an AI assistant calling from ${lead.sellerCompanyName}. Do you have a quick moment to chat about your recent interest?`;
-  }
+  // Turn-based: respond immediately with a template opening.
+  // Waiting on Gemini here routinely exceeds Twilio's webhook limit (~15s)
+  // and Twilio then says "an application error has occurred" and hangs up.
+  const opening = defaultOpening(lead);
 
   await prisma.callTranscript.create({
     data: {
@@ -505,15 +525,25 @@ export async function handleTwilioGather(input: {
 
   let turn;
   try {
-    turn = await generateVoiceTurn({
-      lead,
-      transcript: history,
-      leadUtterance: utterance || "(no speech detected)",
+    turn = await withDeadline(
+      generateVoiceTurn({
+        lead,
+        transcript: history,
+        leadUtterance: utterance || "(no speech detected)",
+      }),
+      VOICE_AI_DEADLINE_MS
+    );
+  } catch (error) {
+    console.warn("[voice] gather AI deadline/fallback", {
+      callId: call.id,
+      message: error instanceof Error ? error.message : "unknown",
     });
-  } catch {
     turn = {
-      reply: "Thanks for your time. I'll have someone from our team follow up. Goodbye.",
-      endCall: true,
+      reply:
+        utterance.trim().length === 0
+          ? "Sorry, I did not catch that. Could you please repeat that briefly?"
+          : "Thanks for sharing that. I'll have someone from our team follow up with you shortly. Goodbye.",
+      endCall: utterance.trim().length > 0,
       handoffRequested: false,
       appointmentRequested: false,
       optOut: false,
@@ -597,7 +627,8 @@ export async function handleTwilioStatus(input: {
   await prisma.call.update({ where: { id: call.id }, data });
 
   if (mapped === CallStatus.COMPLETED) {
-    await finalizeCompletedCall(call.id).catch((error) => {
+    // Fire-and-forget so status webhook returns quickly; finalize is idempotent.
+    void finalizeCompletedCall(call.id).catch((error) => {
       console.error("[voice] finalize call failed", {
         callId: call.id,
         errorType: "finalize",
@@ -608,6 +639,16 @@ export async function handleTwilioStatus(input: {
 }
 
 async function finalizeCompletedCall(callId: string) {
+  if (finalizingCalls.has(callId)) return;
+  finalizingCalls.add(callId);
+  try {
+    await finalizeCompletedCallInner(callId);
+  } finally {
+    finalizingCalls.delete(callId);
+  }
+}
+
+async function finalizeCompletedCallInner(callId: string) {
   const call = await prisma.call.findUnique({
     where: { id: callId },
     include: {
@@ -720,9 +761,28 @@ async function finalizeCompletedCall(callId: string) {
         : summary.nextAction;
 
   await prisma.$transaction([
-    prisma.callSummary.create({
-      data: {
+    prisma.callSummary.upsert({
+      where: { callId: call.id },
+      create: {
         callId: call.id,
+        summary: summary.summary,
+        outcome: summary.outcome,
+        interestLevel: summary.interestLevel,
+        keyRequirements: summary.keyRequirements,
+        painPoints: summary.painPoints,
+        objectionList: summary.objections,
+        objections: summary.objections.join("; ") || null,
+        requirements: summary.keyRequirements.join("; ") || null,
+        nextAction,
+        followUpRecommended: summary.followUpRecommended,
+        intent: summary.interestLevel,
+        appointmentStatus,
+        preferredMeetingTime,
+        appointmentDateTime,
+        appointmentTimezone,
+        appointmentId,
+      },
+      update: {
         summary: summary.summary,
         outcome: summary.outcome,
         interestLevel: summary.interestLevel,
