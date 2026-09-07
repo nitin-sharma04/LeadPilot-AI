@@ -2,7 +2,7 @@
  * G.711 µ-law codec + resampling for Twilio ↔ Gemini Live.
  * Twilio: audio/x-mulaw @ 8 kHz
  * Gemini Live input: PCM16 LE @ 16 kHz
- * Gemini Live output: PCM16 LE @ 24 kHz
+ * Gemini Live output: PCM16 LE @ 24 kHz (verify mime rate — wrong rate = sped-up playback)
  */
 
 const MULAW_BIAS = 0x84;
@@ -58,17 +58,39 @@ export function upsample8kTo16k(pcm8k: Int16Array): Int16Array {
   return out;
 }
 
-/** Downsample 24 kHz → 8 kHz by averaging each group of 3 samples. */
-export function downsample24kTo8k(pcm24k: Int16Array): Int16Array {
-  const outLen = Math.floor(pcm24k.length / 3);
+/** Downsample by averaging groups of `factor` samples (integer factor only). */
+export function downsampleByFactor(pcm: Int16Array, factor: number): Int16Array {
+  if (factor <= 1) return pcm;
+  const outLen = Math.floor(pcm.length / factor);
   const out = new Int16Array(outLen);
   for (let i = 0; i < outLen; i++) {
-    const i0 = i * 3;
-    out[i] = Math.round(
-      (pcm24k[i0] + pcm24k[i0 + 1] + pcm24k[i0 + 2]) / 3
-    );
+    const i0 = i * factor;
+    let sum = 0;
+    for (let j = 0; j < factor; j++) sum += pcm[i0 + j];
+    out[i] = Math.round(sum / factor);
   }
   return out;
+}
+
+/** Downsample 24 kHz → 8 kHz by averaging each group of 3 samples. */
+export function downsample24kTo8k(pcm24k: Int16Array): Int16Array {
+  return downsampleByFactor(pcm24k, 3);
+}
+
+/** Downsample 16 kHz → 8 kHz by averaging pairs. */
+export function downsample16kTo8k(pcm16k: Int16Array): Int16Array {
+  return downsampleByFactor(pcm16k, 2);
+}
+
+export function parsePcmSampleRate(mimeType: string | undefined): number {
+  if (!mimeType) return 24000;
+  const m = mimeType.match(/rate\s*=\s*(\d+)/i);
+  if (!m) return 24000;
+  const rate = Number.parseInt(m[1], 10);
+  if (rate === 8000 || rate === 16000 || rate === 24000 || rate === 48000) {
+    return rate;
+  }
+  return 24000;
 }
 
 export function int16ToBuffer(samples: Int16Array): Buffer {
@@ -86,9 +108,31 @@ export function mulaw8kToPcm16kBase64(mulawB64: string): string {
   return int16ToBuffer(pcm16k).toString("base64");
 }
 
-export function pcm24kBase64ToMulaw8k(pcmB64: string): string {
+/**
+ * Convert Gemini PCM (typically 24 kHz, sometimes 16 kHz) → Twilio µ-law 8 kHz.
+ * Using the wrong source rate makes playback sound sped-up or slowed-down.
+ */
+export function pcmBase64ToMulaw8k(
+  pcmB64: string,
+  sourceRateHz = 24000
+): string {
   const pcmBuf = Buffer.from(pcmB64, "base64");
-  const pcm24k = bufferToInt16(pcmBuf);
-  const pcm8k = downsample24kTo8k(pcm24k);
+  const pcm = bufferToInt16(pcmBuf);
+  let pcm8k: Int16Array;
+  if (sourceRateHz === 8000) {
+    pcm8k = pcm;
+  } else if (sourceRateHz === 16000) {
+    pcm8k = downsample16kTo8k(pcm);
+  } else if (sourceRateHz === 48000) {
+    pcm8k = downsampleByFactor(pcm, 6);
+  } else {
+    // Default / 24000
+    pcm8k = downsample24kTo8k(pcm);
+  }
   return mulawEncode(pcm8k).toString("base64");
+}
+
+/** @deprecated Prefer pcmBase64ToMulaw8k(pcm, 24000) */
+export function pcm24kBase64ToMulaw8k(pcmB64: string): string {
+  return pcmBase64ToMulaw8k(pcmB64, 24000);
 }

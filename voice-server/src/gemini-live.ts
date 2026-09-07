@@ -2,7 +2,8 @@ import WebSocket from "ws";
 import { resolveGeminiLiveVoice, type GeminiLiveVoice } from "./config.js";
 
 export type GeminiLiveHandlers = {
-  onAudioPcm24kBase64: (b64: string) => void;
+  /** PCM audio from Gemini Live; sampleRateHz from mime (usually 24000). */
+  onAudioPcm24kBase64: (b64: string, sampleRateHz?: number) => void;
   onInterrupted: () => void;
   /** Interim lead transcription (do not persist). */
   onInputTranscriptInterim?: (text: string) => void;
@@ -96,14 +97,15 @@ export class GeminiLiveSession {
               mode: "SMART",
             },
             outputAudioTranscription: {},
-            // VAD: barge-in promptly; allow brief natural pauses before ending the user turn.
+            // VAD: barge-in promptly; allow natural pauses so full utterances
+            // like "Schedule a meeting with your members" complete before turn end.
             realtimeInputConfig: {
               automaticActivityDetection: {
                 disabled: false,
                 startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
                 endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-                prefixPaddingMs: 20,
-                silenceDurationMs: 700,
+                prefixPaddingMs: 40,
+                silenceDurationMs: 950,
               },
             },
           },
@@ -203,7 +205,11 @@ export class GeminiLiveSession {
         }
       }
 
-      this.handlers.onAudioPcm24kBase64(data);
+      const rateMatch = mime.match(/rate\s*=\s*(\d+)/i);
+      const sampleRateHz = rateMatch
+        ? Number.parseInt(rateMatch[1], 10)
+        : 24000;
+      this.handlers.onAudioPcm24kBase64(data, sampleRateHz);
     }
 
     if (serverContent.generationComplete) {
@@ -253,7 +259,7 @@ export class GeminiLiveSession {
     this.ws.send(
       JSON.stringify({
         realtimeInput: {
-          text: "The call was just answered. Give a brief natural greeting, say who you are, and ask if they have a quick moment. One short question only.",
+          text: "The call was just answered. Greet them warmly by name if known, say who you are and which company, and ask if they have a quick moment. Sound like a calm human SDR — natural pace, not rushed. One short question only.",
         },
       })
     );

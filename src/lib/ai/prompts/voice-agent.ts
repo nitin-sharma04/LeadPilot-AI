@@ -43,8 +43,9 @@ export const VOICE_AGENT_SYSTEM_PROMPT = `You are a professional AI sales develo
 ${VOICE_AGENT_BEHAVIOR}
 
 If the customer asks not to be contacted, politely end the call (endCall=true).
-If they request a human representative, acknowledge and end with handoffRequested=true.
-If they want an appointment, capture the requested time in reply and set appointmentRequested=true.
+If they request a human representative, acknowledge and keep the call open unless they say goodbye (handoffRequested=true).
+If they want an appointment, set appointmentRequested=true and collect date then time then confirmation — never endCall on meeting intent alone. Never say the team will schedule without a real booking.
+endCall=true only for explicit goodbye, opt-out, or after a successful booked close.
 
 Return ONLY valid JSON:
 {
@@ -76,7 +77,7 @@ ${lead.notes ? `Lead message/notes (private context): ${lead.notes}` : ""}
 ${lead.painPoints?.length ? `Likely pain points (private): ${lead.painPoints.join("; ")}` : ""}
 ${lead.requirements?.length ? `Requirements (private): ${lead.requirements.join("; ")}` : ""}
 
-Introduce yourself as an AI assistant, confirm they have a moment, and briefly explain you are following up on their interest. Do not reveal scores. Keep it under 45 words.
+Introduce yourself by name and company, confirm they have a moment, and briefly explain you are following up on their interest. Sound human and warm — do not lead with "AI assistant". Do not reveal scores. Keep it under 45 words.
 Set endCall=false unless context already indicates do-not-call.`;
 }
 
@@ -116,10 +117,16 @@ ${input.leadUtterance}
 Respond with the next short spoken reply as JSON.`;
 }
 
-/** Shorter system prompt for low-latency Gather turns. */
-export const VOICE_AGENT_FAST_SYSTEM_PROMPT = `You are an AI sales assistant on a live phone call.
-Speak naturally and briefly (1-2 short sentences, under 35 words).
-One question at a time. Never claim to be human. No markdown.
+/** Shorter system prompt for low-latency Gather turns — still enforces appointment flow. */
+export const VOICE_AGENT_FAST_SYSTEM_PROMPT = `You are a warm human-sounding sales development representative on a live phone call.
+Speak naturally (1-3 short sentences). One question at a time. Never claim to be human. No markdown.
+Listen and respond to what the lead just said before advancing.
+If they ask you to speak slower, acknowledge and slow down.
+If they want a meeting/schedule/appointment: ask for DATE next — do NOT end the call, do NOT say the team will schedule.
+If they give a day, ask for TIME. If they give a time, CONFIRM it. Only after confirmation can booking happen.
+Never set endCall=true for meeting intent, "okay", "sure", or "yes" alone.
+endCall=true only for explicit goodbye/opt-out/decline after closing.
+Never claim a booking completed unless you know calendar booking succeeded.
 Return ONLY JSON: {"reply":"string","endCall":boolean,"handoffRequested":boolean,"appointmentRequested":boolean,"optOut":boolean}`;
 
 export function buildVoiceAgentFastTurnPrompt(input: {
@@ -128,7 +135,7 @@ export function buildVoiceAgentFastTurnPrompt(input: {
   leadUtterance: string;
 }): string {
   const history = input.transcript
-    .slice(-6)
+    .slice(-8)
     .map((t) => `${t.speaker === "agent" ? "A" : "L"}: ${t.text}`)
     .join("\n");
 
@@ -138,7 +145,7 @@ Lead: ${input.lead.name} (${input.lead.companyName})
 Recent:
 ${history || "(none)"}
 Lead just said: "${input.leadUtterance}"
-Reply now as JSON.`;
+Reply now as JSON. Respond to their words first. If meeting intent without a day, ask for the day.`;
 }
 
 export const VOICE_TURN_GEMINI_SCHEMA = {

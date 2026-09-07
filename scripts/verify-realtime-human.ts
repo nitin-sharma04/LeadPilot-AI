@@ -30,12 +30,14 @@ assert(resolveGeminiLiveVoice("Nope") === "Aoede", "unsupported → Aoede");
 assert(GEMINI_LIVE_VOICES.includes("Sulafat"), "Sulafat supported");
 
 // 2 prompt behavior
-assert(REALTIME_HUMAN_SDR_PROMPT.includes("ONE question"), "one question");
+assert(REALTIME_HUMAN_SDR_PROMPT.includes("one question"), "one question");
 assert(
   REALTIME_HUMAN_SDR_PROMPT.includes("NEVER say booked") ||
     REALTIME_HUMAN_SDR_PROMPT.includes("SYSTEM booking success"),
   "no false booking"
 );
+assert(REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE"), "appointment stages");
+assert(REALTIME_HUMAN_SDR_PROMPT.includes("slow down"), "pace respect");
 assert(!REALTIME_HUMAN_SDR_PROMPT.includes("Certainly. Wonderful."), "no rigid fillers");
 
 // 3 smart transcription config present in gemini-live
@@ -47,6 +49,12 @@ assert(geminiSrc.includes('mode: "SMART"'), "SMART transcription");
 assert(geminiSrc.includes("prebuiltVoiceConfig"), "speechConfig voice");
 assert(geminiSrc.includes("START_SENSITIVITY_HIGH"), "VAD barge-in");
 assert(geminiSrc.includes("silenceDurationMs"), "VAD silence");
+assert(!geminiSrc.includes("112%"), "no speech acceleration");
+
+// Gather must not accelerate TTS
+const gatherTwiml = buildGatherTwiml({ sayText: "Hi", actionUrl: "https://x/g" });
+assert(!gatherTwiml.includes("112%"), "gather no 112%");
+assert(gatherTwiml.includes('speechTimeout="auto"'), "gather speechTimeout auto");
 
 // 4 vocabulary
 const vocab = resolveCustomVocabulary(["CustomCo"]);
@@ -108,6 +116,14 @@ if (prev !== undefined) process.env.VOICE_MODE = prev;
 else delete process.env.VOICE_MODE;
 
 assert(buildGatherTwiml({ sayText: "Hi", actionUrl: "https://x/g" }).includes("<Gather"), "Gather exists");
+assert(
+  !detectsEndCallIntent("Okay."),
+  "okay is not hangup"
+);
+assert(
+  !detectsEndCallIntent("I want to schedule a meeting."),
+  "meeting intent is not hangup"
+);
 assert(
   buildConnectStreamTwiml({
     streamUrl: "wss://x/media-stream",

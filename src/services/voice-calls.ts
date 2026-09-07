@@ -22,6 +22,13 @@ import {
 } from "@/lib/ai/voice-agent";
 import type { VoiceAgentLeadContext } from "@/lib/ai/prompts/voice-agent";
 import { normalizeTranscriptText } from "@/lib/voice/transcript-cleanup";
+import {
+  clearGatherCallState,
+  heuristicGatherTurn,
+  noteGatherBookingResult,
+  sanitizeGatherModelTurn,
+} from "@/lib/voice/gather-call-state";
+import { pollyProsodyRate } from "@/lib/voice/speech-pace";
 
 const inFlight = new Set<string>();
 const lastCallAt = new Map<string, number>();
@@ -32,67 +39,9 @@ const VOICE_AI_DEADLINE_MS = 7_000;
 
 function defaultOpening(lead: VoiceAgentLeadContext): string {
   const first = lead.name.split(" ")[0] || "there";
-  return `Hi ${first}, this is ${lead.agentName}, an AI assistant calling from ${lead.sellerCompanyName}. Do you have a quick moment to chat about your recent interest?`;
-}
-
-function heuristicVoiceTurn(utterance: string): {
-  reply: string;
-  endCall: boolean;
-  handoffRequested: boolean;
-  appointmentRequested: boolean;
-  optOut: boolean;
-} {
-  const text = utterance.toLowerCase();
-  if (!text.trim()) {
-    return {
-      reply: "Sorry, I did not catch that. Could you say that one more time?",
-      endCall: false,
-      handoffRequested: false,
-      appointmentRequested: false,
-      optOut: false,
-    };
-  }
-  if (
-    /don'?t call|do not call|stop calling|remove me|unsubscribe|not interested/.test(
-      text
-    )
-  ) {
-    return {
-      reply: "Understood. I will make sure we do not call again. Thank you, goodbye.",
-      endCall: true,
-      handoffRequested: false,
-      appointmentRequested: false,
-      optOut: true,
-    };
-  }
-  if (/schedule|meeting|appointment|book|calendar|set up a call/.test(text)) {
-    return {
-      reply:
-        "Perfect. I will have our team schedule a meeting with you and send the details shortly. Thanks, goodbye.",
-      endCall: true,
-      handoffRequested: false,
-      appointmentRequested: true,
-      optOut: false,
-    };
-  }
-  if (/human|person|team|representative|agent|connect (me )?directly/.test(text)) {
-    return {
-      reply:
-        "Absolutely. I will connect you with our team and have someone follow up directly. Thanks for your time, goodbye.",
-      endCall: true,
-      handoffRequested: true,
-      appointmentRequested: false,
-      optOut: false,
-    };
-  }
-  return {
-    reply:
-      "Got it. What is the main goal you are hoping to achieve with this right now?",
-    endCall: false,
-    handoffRequested: false,
-    appointmentRequested: false,
-    optOut: false,
-  };
+  const agent = lead.agentName || "Alex";
+  const seller = lead.sellerCompanyName || "our team";
+  return `Hi ${first}, this is ${agent} calling from ${seller}. Do you have a quick moment to chat about your recent interest?`;
 }
 
 async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -654,7 +603,7 @@ export async function handleTwilioGather(input: {
 
   let turn;
   try {
-    turn = await withDeadline(
+    const modelTurn = await withDeadline(
       generateVoiceTurnFast({
         lead,
         transcript: history,
@@ -662,12 +611,43 @@ export async function handleTwilioGather(input: {
       }),
       VOICE_AI_DEADLINE_MS
     );
+    turn = sanitizeGatherModelTurn(call.id, utterance, modelTurn);
   } catch (error) {
     console.warn("[voice] gather AI deadline/fallback", {
       callId: call.id,
       message: error instanceof Error ? error.message : "unknown",
     });
-    turn = heuristicVoiceTurn(utterance);
+    turn = heuristicGatherTurn(call.id, utterance);
+  }
+
+  // Mid-call booking only after explicit confirmation + date/time (never claim without success).
+  if (turn.shouldBook) {
+    try {
+      const { attemptBookAppointmentFromCall } = await import(
+        "@/services/voice-appointment-booking"
+      );
+      const booking = await attemptBookAppointmentFromCall({
+        callId: call.id,
+        preferredTimeText: turn.preferredTimeText || undefined,
+        forceConfirmed: true,
+      });
+      turn = {
+        ...turn,
+        reply: noteGatherBookingResult(call.id, booking.booked),
+        endCall: booking.booked,
+        appointmentRequested: true,
+      };
+    } catch (error) {
+      console.warn("[voice] gather mid-call book failed", {
+        callId: call.id,
+        message: error instanceof Error ? error.message : "unknown",
+      });
+      turn = {
+        ...turn,
+        reply: noteGatherBookingResult(call.id, false),
+        endCall: false,
+      };
+    }
   }
 
   await prisma.callTranscript.create({
@@ -678,7 +658,9 @@ export async function handleTwilioGather(input: {
     },
   });
 
-  if (turn.optOut || turn.endCall || turn.handoffRequested) {
+  const prosodyRate = pollyProsodyRate(turn.speechPace);
+
+  if (turn.optOut || turn.endCall) {
     if (turn.optOut) {
       const leadRow = await prisma.lead.findUnique({
         where: { id: call.leadId },
@@ -696,12 +678,12 @@ export async function handleTwilioGather(input: {
         });
       }
     }
-
-    return buildHangupTwiml({ sayText: turn.reply });
+    clearGatherCallState(call.id);
+    return buildHangupTwiml({ sayText: turn.reply, prosodyRate });
   }
 
   const actionUrl = `${cfg.webhookBaseUrl}/api/voice/twilio/gather?callId=${encodeURIComponent(call.id)}`;
-  return buildGatherTwiml({ sayText: turn.reply, actionUrl });
+  return buildGatherTwiml({ sayText: turn.reply, actionUrl, prosodyRate });
 }
 
 export async function handleTwilioStatus(input: {

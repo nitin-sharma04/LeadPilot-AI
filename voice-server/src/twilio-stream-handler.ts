@@ -1,5 +1,9 @@
 import type WebSocket from "ws";
-import { mulaw8kToPcm16kBase64, pcm24kBase64ToMulaw8k } from "./audio.js";
+import {
+  mulaw8kToPcm16kBase64,
+  parsePcmSampleRate,
+  pcmBase64ToMulaw8k,
+} from "./audio.js";
 import {
   bookAppointmentFromVoiceCall,
   finalizeVoiceAppointment,
@@ -15,6 +19,11 @@ import {
   isUnclearUtterance,
 } from "./end-call-intent.js";
 import { GeminiLiveSession } from "./gemini-live.js";
+import {
+  detectsSlowSpeechRequest,
+  slowSpeechSystemNudge,
+  type SpeechPace,
+} from "./speech-pace.js";
 import { TranscriptFinalizer } from "./transcript-finalizer.js";
 import { completeTwilioCall } from "./twilio-hangup.js";
 
@@ -50,6 +59,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   let closingPromptSent = false;
   const apptTracker = new AppointmentIntentTracker();
   let finalizeApptSent = false;
+  let speechPace: SpeechPace = "normal";
+  let lastCoachingHint: string | null = null;
 
   const tryBookOnLeadConfirmation = async (leadText: string) => {
     if (!callId || !streamToken || !gemini) return;
@@ -314,12 +325,16 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
               });
               gemini?.requestOpening();
             },
-            onAudioPcm24kBase64: (pcmB64) => {
+            onAudioPcm24kBase64: (pcmB64, sampleRateHz) => {
               if (endController && !endController.shouldAcceptOutboundAudio) {
                 return;
               }
               try {
-                const mulaw = pcm24kBase64ToMulaw8k(pcmB64);
+                const rate =
+                  typeof sampleRateHz === "number" && sampleRateHz > 0
+                    ? sampleRateHz
+                    : parsePcmSampleRate(undefined);
+                const mulaw = pcmBase64ToMulaw8k(pcmB64, rate);
                 sendMulawAudio(mulaw);
               } catch (error) {
                 console.error("[voice-server] audio downconvert failed", {
@@ -340,6 +355,17 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             onInputTranscript: (text) => {
               if (endController?.isEnding) return;
               finalizer?.appendLead(text);
+              if (detectsSlowSpeechRequest(text) && speechPace !== "slow") {
+                speechPace = "slow";
+                console.info("[voice-server] speechPace=slow", { callId });
+                gemini?.notifySystem(slowSpeechSystemNudge());
+              }
+              apptTracker.noteLead(text);
+              const hint = apptTracker.coachingHint();
+              if (hint && hint !== lastCoachingHint) {
+                lastCoachingHint = hint;
+                gemini?.notifySystem(hint);
+              }
               void tryBookOnLeadConfirmation(text);
             },
             onOutputTranscript: (text) => {
@@ -376,6 +402,14 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                   agentTurnCount >= 2 &&
                   detectsAgentFarewell(agentText)
                 ) {
+                  // Never hang up mid appointment collection on a premature model goodbye.
+                  if (apptTracker.isFlowActive && !apptTracker.hasBooked) {
+                    const hint =
+                      apptTracker.coachingHint() ||
+                      "Do NOT end the call. Continue the appointment flow (date, time, confirm). Do not claim the team will schedule.";
+                    gemini?.notifySystem(hint);
+                    return;
+                  }
                   beginEndFlow({
                     reason: "agent_farewell",
                     awaitFarewellDelivery: true,
@@ -390,6 +424,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 // Backup if confirmation arrived only after flush (idempotent via tracker).
                 await tryBookOnLeadConfirmation(leadUtterance);
 
+                if (detectsSlowSpeechRequest(leadUtterance) && speechPace !== "slow") {
+                  speechPace = "slow";
+                  gemini?.notifySystem(slowSpeechSystemNudge());
+                }
+
+                // Meeting intent is not hangup (detectsEndCallIntent is strict).
                 if (detectsEndCallIntent(leadUtterance)) {
                   const force = detectsForceHangupIntent(leadUtterance);
                   beginEndFlow({
@@ -397,6 +437,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                     awaitFarewellDelivery: true,
                     sendClosingPrompt: true,
                   });
+                } else if (apptTracker.isFlowActive) {
+                  const hint = apptTracker.coachingHint();
+                  if (hint && hint !== lastCoachingHint) {
+                    lastCoachingHint = hint;
+                    gemini?.notifySystem(hint);
+                  }
                 }
               })();
             },

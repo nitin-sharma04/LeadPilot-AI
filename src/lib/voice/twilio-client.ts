@@ -365,22 +365,32 @@ export function escapeXml(text: string): string {
     .replaceAll("'", "&apos;");
 }
 
+function wrapSaySsml(text: string, prosodyRate: string | null | undefined): string {
+  const say = escapeXml(text.slice(0, 1500));
+  // Never accelerate speech (no 112%). Optional slower rate only when lead asked.
+  if (prosodyRate) {
+    return `<prosody rate="${escapeXml(prosodyRate)}">${say}</prosody>`;
+  }
+  return say;
+}
+
 export function buildGatherTwiml(input: {
   sayText: string;
   actionUrl: string;
   voice?: string;
+  /** Polly SSML rate, e.g. "88%" when speechPace=slow. Omit for natural pace. */
+  prosodyRate?: string | null;
 }): string {
   const voice = input.voice || "Polly.Joanna";
-  const say = escapeXml(input.sayText.slice(0, 500));
+  const sayBody = wrapSaySsml(input.sayText, input.prosodyRate);
   const action = escapeXml(input.actionUrl);
-  // speechTimeout=1 ends listen quickly after the caller stops talking.
-  // SSML prosody speeds TTS slightly so turns feel more natural.
+  // speechTimeout=auto allows natural pauses; do not cut the lead mid-thought.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" timeout="4" speechTimeout="1" language="en-US" action="${action}" method="POST" actionOnEmptyResult="true">
-    <Say voice="${voice}"><prosody rate="112%">${say}</prosody></Say>
+  <Gather input="speech" speechTimeout="auto" language="en-US" action="${action}" method="POST" actionOnEmptyResult="true">
+    <Say voice="${voice}">${sayBody}</Say>
   </Gather>
-  <Say voice="${voice}"><prosody rate="112%">I did not catch that. Goodbye for now.</prosody></Say>
+  <Say voice="${voice}">I did not catch that. Goodbye for now.</Say>
   <Hangup/>
 </Response>`;
 }
@@ -388,12 +398,13 @@ export function buildGatherTwiml(input: {
 export function buildHangupTwiml(input: {
   sayText: string;
   voice?: string;
+  prosodyRate?: string | null;
 }): string {
   const voice = input.voice || "Polly.Joanna";
-  const say = escapeXml(input.sayText.slice(0, 500));
+  const sayBody = wrapSaySsml(input.sayText, input.prosodyRate);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="${voice}"><prosody rate="112%">${say}</prosody></Say>
+  <Say voice="${voice}">${sayBody}</Say>
   <Hangup/>
 </Response>`;
 }

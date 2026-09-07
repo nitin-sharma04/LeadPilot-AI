@@ -47,6 +47,17 @@ const AGENT_FAREWELL_PATTERNS: RegExp[] = [
 export function detectsEndCallIntent(utterance: string): boolean {
   const text = utterance.replace(/\s+/g, " ").trim();
   if (!text) return false;
+  // Bare acknowledgements / affirmations are NOT hangup.
+  if (/^(okay|ok|sure|yes|yeah|yep|alright|right|perfect)\.?$/i.test(text)) {
+    return false;
+  }
+  // Meeting / schedule requests are NEVER hangup by themselves.
+  if (
+    /\b(schedule|meeting|appointment|book|calendar)\b/i.test(text) &&
+    !/\b(good\s*bye|goodbye|hang\s*up|end\s+the\s+call)\b/i.test(text)
+  ) {
+    return false;
+  }
   if (detectsForceHangupIntent(text)) return true;
   return END_CALL_PATTERNS.some((re) => re.test(text));
 }
