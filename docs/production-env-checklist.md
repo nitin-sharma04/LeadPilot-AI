@@ -21,8 +21,12 @@ Set these in the **hosting dashboard** (never commit real values).
 | Variable | Notes |
 |----------|--------|
 | `CRON_SECRET` | Protects `/api/cron/email-followups` |
+| `VOICE_MODE` | Prefer `realtime` |
 | `VOICE_WEBHOOK_BASE_URL` | Public HTTPS of the Next.js app |
-| `VOICE_STREAM_URL` | Public `wss://…/media-stream` of voice-server |
+| `VOICE_STREAM_URL` | Stable public WSS of **leadpilot-voice**, e.g. `wss://leadpilot-voice.onrender.com/media-stream` (not trycloudflare/ngrok) |
+| `GEMINI_LIVE_MODEL` | e.g. `gemini-3.1-flash-live-preview` |
+| `GEMINI_LIVE_VOICE` | e.g. `Aoede` |
+| `VOICE_MAX_CALL_DURATION_SECONDS` | Default `600` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Live Calendar/Gmail |
 | `GOOGLE_REDIRECT_URI` | `https://YOUR_DOMAIN/api/integrations/google-calendar/callback` |
 | `GOOGLE_GMAIL_REDIRECT_URI` | `https://YOUR_DOMAIN/api/integrations/gmail/callback` |

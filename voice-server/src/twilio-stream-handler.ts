@@ -329,6 +329,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             },
             onInterrupted: () => {
               if (endController?.isEnding) return;
+              console.info("[voice-server] barge-in", { callId });
               sendClear();
               finalizer?.discardAgentBuffer();
             },

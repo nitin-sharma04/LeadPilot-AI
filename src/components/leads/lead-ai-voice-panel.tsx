@@ -371,8 +371,8 @@ export function LeadAiVoicePanel({
                     ? "Realtime AI active"
                     : ACTIVE.has(live.status)
                       ? "Realtime (connecting)"
-                      : "Realtime"
-                  : "Turn-based AI"}
+                      : "Realtime (Gemini Live)"
+                  : "Turn-based fallback"}
               </Badge>
               {live.outcome ? <Badge variant="outline">{live.outcome}</Badge> : null}
             </div>

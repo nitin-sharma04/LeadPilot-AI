@@ -33,6 +33,8 @@ export class GeminiLiveSession {
   private closed = false;
   /** After barge-in, drop stale outbound audio until a fresh model turn starts. */
   private dropOutboundAudio = false;
+  /** True after interrupt until the first non-interrupted model audio arrives. */
+  private awaitingFreshAudio = false;
   /** After end-call: ignore inbound mic audio and block new non-closing prompts. */
   private acceptInput = true;
   private readonly voice: GeminiLiveVoice;
@@ -94,14 +96,14 @@ export class GeminiLiveSession {
               mode: "SMART",
             },
             outputAudioTranscription: {},
-            // VAD: detect barge-in promptly; wait a bit before ending the user turn.
+            // VAD: barge-in promptly; allow brief natural pauses before ending the user turn.
             realtimeInputConfig: {
               automaticActivityDetection: {
                 disabled: false,
                 startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
                 endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
                 prefixPaddingMs: 20,
-                silenceDurationMs: 550,
+                silenceDurationMs: 700,
               },
             },
           },
@@ -159,8 +161,10 @@ export class GeminiLiveSession {
 
     if (!serverContent) return;
 
-    if (serverContent.interrupted) {
+    const wasInterrupted = Boolean(serverContent.interrupted);
+    if (wasInterrupted) {
       this.dropOutboundAudio = true;
+      this.awaitingFreshAudio = true;
       this.handlers.onInterrupted();
     }
 
@@ -181,18 +185,25 @@ export class GeminiLiveSession {
     }
 
     const parts = serverContent.modelTurn?.parts ?? [];
-    if (parts.length > 0) {
-      // Fresh model audio after interrupt
-      this.dropOutboundAudio = false;
-    }
-
     for (const part of parts) {
       const data = part.inlineData?.data;
       const mime = part.inlineData?.mimeType || "";
-      if (data && mime.includes("audio")) {
-        if (this.dropOutboundAudio) continue;
-        this.handlers.onAudioPcm24kBase64(data);
+      if (!(data && mime.includes("audio"))) continue;
+
+      // Drop any audio packaged with the interrupt signal (stale).
+      if (wasInterrupted) continue;
+
+      // After barge-in, the next model audio without interrupt is the fresh turn.
+      if (this.dropOutboundAudio) {
+        if (this.awaitingFreshAudio) {
+          this.dropOutboundAudio = false;
+          this.awaitingFreshAudio = false;
+        } else {
+          continue;
+        }
       }
+
+      this.handlers.onAudioPcm24kBase64(data);
     }
 
     if (serverContent.generationComplete) {

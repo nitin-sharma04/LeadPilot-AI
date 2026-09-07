@@ -86,7 +86,7 @@ export function CallsClient({ calls }: { calls: CallListItem[] }) {
                         <Badge variant="secondary">
                           {call.voiceMode === "realtime"
                             ? "Realtime"
-                            : "Turn-based"}
+                            : "Turn-based fallback"}
                         </Badge>
                       </td>
                       <td className="px-3 py-3.5">

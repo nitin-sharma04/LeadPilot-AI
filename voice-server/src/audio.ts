@@ -58,12 +58,15 @@ export function upsample8kTo16k(pcm8k: Int16Array): Int16Array {
   return out;
 }
 
-/** Downsample 24 kHz → 8 kHz by taking every 3rd sample. */
+/** Downsample 24 kHz → 8 kHz by averaging each group of 3 samples. */
 export function downsample24kTo8k(pcm24k: Int16Array): Int16Array {
   const outLen = Math.floor(pcm24k.length / 3);
   const out = new Int16Array(outLen);
   for (let i = 0; i < outLen; i++) {
-    out[i] = pcm24k[i * 3];
+    const i0 = i * 3;
+    out[i] = Math.round(
+      (pcm24k[i0] + pcm24k[i0 + 1] + pcm24k[i0 + 2]) / 3
+    );
   }
   return out;
 }

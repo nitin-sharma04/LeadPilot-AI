@@ -55,7 +55,9 @@ export function CallDetailPanel({ call }: { call: CallDetailView }) {
           <Info
             label="Call mode"
             value={
-              call.voiceMode === "realtime" ? "Realtime" : "Turn-based"
+              call.voiceMode === "realtime"
+                ? "Realtime (Gemini Live)"
+                : "Turn-based fallback"
             }
           />
           <Info label="Provider" value={call.provider ?? "Twilio"} />
