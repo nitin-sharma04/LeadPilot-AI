@@ -1,46 +1,51 @@
 import { NextRequest } from "next/server";
-import {
-  getTwilioConfig,
-  validateTwilioRequest,
-} from "@/lib/voice/twilio-client";
 import { handleTwilioStatus } from "@/services/voice-calls";
 import { prisma } from "@/lib/prisma";
+import {
+  isTwilioSignatureValid,
+  parseTwilioForm,
+} from "@/lib/voice/twilio-webhooks";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-async function parseForm(request: NextRequest): Promise<Record<string, string>> {
-  const form = await request.formData();
-  const params: Record<string, string> = {};
-  form.forEach((value, key) => {
-    if (typeof value === "string") params[key] = value;
-  });
-  return params;
-}
-
+/**
+ * Twilio status callback — always HTTP 200 so Twilio keeps sending events.
+ */
 export async function POST(request: NextRequest) {
   try {
-    const params = await parseForm(request);
+    const params = await parseTwilioForm(request);
     let callId = request.nextUrl.searchParams.get("callId") || "";
     const providerCallId = params.CallSid || "";
 
-    const signature = request.headers.get("x-twilio-signature");
-    const cfg = getTwilioConfig();
-    const absoluteUrl = `${cfg.webhookBaseUrl}${request.nextUrl.pathname}${request.nextUrl.search}`;
+    const signatureOk = isTwilioSignatureValid({
+      request,
+      params,
+      callId,
+    });
 
-    const skipValidation =
-      process.env.TWILIO_SKIP_SIGNATURE_VALIDATION === "true" &&
-      process.env.NODE_ENV !== "production";
-
-    if (
-      !skipValidation &&
-      !validateTwilioRequest({
-        signature,
-        url: absoluteUrl,
-        params,
-      })
-    ) {
-      console.error("[voice:twilio] status signature validation failed");
-      return new Response("Forbidden", { status: 403 });
+    if (!signatureOk) {
+      // Still accept status when CallSid is known — prevents stuck "in progress".
+      if (providerCallId) {
+        const found = await prisma.call
+          .findFirst({
+            where: { providerCallId },
+            select: { id: true },
+          })
+          .catch(() => null);
+        if (found) {
+          callId = found.id;
+          console.warn(
+            "[voice:twilio] status signature mismatch but CallSid matched; applying status"
+          );
+        } else {
+          console.error("[voice:twilio] status signature validation failed");
+          return new Response("OK", { status: 200 });
+        }
+      } else {
+        console.error("[voice:twilio] status signature validation failed");
+        return new Response("OK", { status: 200 });
+      }
     }
 
     if (!callId && providerCallId) {

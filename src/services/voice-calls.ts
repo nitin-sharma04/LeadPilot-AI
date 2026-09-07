@@ -439,33 +439,72 @@ export async function getCallForUser(user: SessionUser, callId: string) {
 }
 
 export async function handleTwilioAnswer(callId: string): Promise<string> {
-  const { lead, call } = await buildLeadContext(callId);
   const cfg = getTwilioConfig();
 
-  const callRow = await prisma.call.findUnique({ where: { id: call.id } });
-  if (!callRow) throw new AppError("Call not found", 404);
+  // Keep this path fast and resilient. Twilio aborts ~15s and any thrown error
+  // used to return HTTP 500 → "An application error has occurred".
+  let callRow: Awaited<ReturnType<typeof prisma.call.findUnique>> & {
+    lead?: { name: string; companyName: string | null };
+    company?: { name: string };
+    agent?: { name: string } | null;
+  } | null = null;
 
-  await prisma.call.update({
-    where: { id: call.id },
-    data: {
-      status: CallStatus.IN_PROGRESS,
-      answeredAt: new Date(),
-    },
-  });
+  try {
+    callRow = await prisma.call.findUnique({
+      where: { id: callId },
+      include: {
+        lead: { select: { name: true, companyName: true } },
+        company: { select: { name: true } },
+        agent: { select: { name: true } },
+      },
+    });
+  } catch (error) {
+    console.error("[voice] answer DB lookup failed", {
+      callId,
+      message: error instanceof Error ? error.message : "unknown",
+    });
+    return buildHangupTwiml({
+      sayText:
+        "Sorry, we ran into a technical issue connecting this call. Please try again later. Goodbye.",
+    });
+  }
+
+  if (!callRow) {
+    return buildHangupTwiml({
+      sayText: "Sorry, this call could not be found. Goodbye.",
+    });
+  }
+
+  void prisma.call
+    .update({
+      where: { id: callRow.id },
+      data: {
+        status: CallStatus.IN_PROGRESS,
+        answeredAt: new Date(),
+      },
+    })
+    .catch((error) => {
+      console.error("[voice] answer status update failed", {
+        callId,
+        message: error instanceof Error ? error.message : "unknown",
+      });
+    });
 
   // Realtime path: bidirectional Media Stream (no Gather)
   if (callRow.voiceMode === "realtime" && callRow.streamToken) {
     const streamUrl = getVoiceStreamUrl();
     if (!streamUrl) {
       console.error("[voice] realtime call missing VOICE_STREAM_URL; failing safely");
-      await prisma.call.update({
-        where: { id: call.id },
-        data: {
-          status: CallStatus.FAILED,
-          endedAt: new Date(),
-          outcome: "Realtime voice stream not configured",
-        },
-      });
+      void prisma.call
+        .update({
+          where: { id: callRow.id },
+          data: {
+            status: CallStatus.FAILED,
+            endedAt: new Date(),
+            outcome: "Realtime voice stream not configured",
+          },
+        })
+        .catch(() => undefined);
       return buildHangupTwiml({
         sayText:
           "Sorry, our realtime voice service is not available right now. Please try again later. Goodbye.",
@@ -473,25 +512,48 @@ export async function handleTwilioAnswer(callId: string): Promise<string> {
     }
     return buildConnectStreamTwiml({
       streamUrl,
-      callId: call.id,
+      callId: callRow.id,
       streamToken: callRow.streamToken,
     });
   }
 
-  // Turn-based: respond immediately with a template opening.
-  // Waiting on Gemini here routinely exceeds Twilio's webhook limit (~15s)
-  // and Twilio then says "an application error has occurred" and hangs up.
-  const opening = defaultOpening(lead);
+  const leadCtx = {
+    name: callRow.lead?.name || "there",
+    companyName: callRow.lead?.companyName || "",
+    jobTitle: null,
+    industry: null,
+    source: null,
+    notes: null,
+    score: null,
+    intent: null,
+    urgency: null,
+    buyingStage: null,
+    requirements: [] as string[],
+    painPoints: [] as string[],
+    objections: [] as string[],
+    recommendation: null,
+    agentName: callRow.agent?.name?.split(" ")[0] || "Alex",
+    sellerCompanyName: callRow.company?.name || "our team",
+  };
 
-  await prisma.callTranscript.create({
-    data: {
-      callId: call.id,
-      speaker: "AI",
-      message: opening,
-    },
-  });
+  const opening = defaultOpening(leadCtx);
 
-  const actionUrl = `${cfg.webhookBaseUrl}/api/voice/twilio/gather?callId=${encodeURIComponent(call.id)}`;
+  void prisma.callTranscript
+    .create({
+      data: {
+        callId: callRow.id,
+        speaker: "AI",
+        message: opening,
+      },
+    })
+    .catch((error) => {
+      console.error("[voice] answer transcript create failed", {
+        callId,
+        message: error instanceof Error ? error.message : "unknown",
+      });
+    });
+
+  const actionUrl = `${cfg.webhookBaseUrl}/api/voice/twilio/gather?callId=${encodeURIComponent(callRow.id)}`;
   return buildGatherTwiml({ sayText: opening, actionUrl });
 }
 

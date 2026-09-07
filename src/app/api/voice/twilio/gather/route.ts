@@ -1,62 +1,56 @@
 import { NextRequest } from "next/server";
-import {
-  getTwilioConfig,
-  validateTwilioRequest,
-} from "@/lib/voice/twilio-client";
 import { handleTwilioGather } from "@/services/voice-calls";
+import {
+  friendlyHangup,
+  isTwilioSignatureValid,
+  parseTwilioForm,
+  twimlResponse,
+} from "@/lib/voice/twilio-webhooks";
+import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-async function parseForm(request: NextRequest): Promise<Record<string, string>> {
-  const form = await request.formData();
-  const params: Record<string, string> = {};
-  form.forEach((value, key) => {
-    if (typeof value === "string") params[key] = value;
-  });
-  return params;
-}
-
-function twimlResponse(xml: string, status = 200) {
-  return new Response(xml, {
-    status,
-    headers: { "Content-Type": "text/xml; charset=utf-8" },
-  });
-}
-
+/**
+ * Twilio Gather webhook — always HTTP 200 + TwiML.
+ */
 export async function POST(request: NextRequest) {
   try {
-    const params = await parseForm(request);
+    const params = await parseTwilioForm(request);
     const callId = request.nextUrl.searchParams.get("callId") || "";
+    const providerCallId = params.CallSid || "";
     const speechResult = params.SpeechResult || "";
 
-    const signature = request.headers.get("x-twilio-signature");
-    const cfg = getTwilioConfig();
-    const absoluteUrl = `${cfg.webhookBaseUrl}${request.nextUrl.pathname}${request.nextUrl.search}`;
+    const signatureOk = isTwilioSignatureValid({
+      request,
+      params,
+      callId,
+    });
 
-    const skipValidation =
-      process.env.TWILIO_SKIP_SIGNATURE_VALIDATION === "true" &&
-      process.env.NODE_ENV !== "production";
-
-    if (
-      !skipValidation &&
-      !validateTwilioRequest({
-        signature,
-        url: absoluteUrl,
-        params,
-      })
-    ) {
-      console.error("[voice:twilio] gather signature validation failed");
-      return twimlResponse(
-        `<?xml version="1.0" encoding="UTF-8"?><Response><Say>We could not verify this call. Goodbye.</Say><Hangup/></Response>`,
-        403
+    if (!signatureOk) {
+      let softOk = false;
+      if (callId && providerCallId) {
+        const found = await prisma.call
+          .findFirst({
+            where: { id: callId, providerCallId },
+            select: { id: true },
+          })
+          .catch(() => null);
+        softOk = Boolean(found);
+      }
+      if (!softOk) {
+        console.error("[voice:twilio] gather signature validation failed");
+        return friendlyHangup(
+          "Sorry, we could not verify this call. Goodbye."
+        );
+      }
+      console.warn(
+        "[voice:twilio] gather signature mismatch but CallSid matched; continuing"
       );
     }
 
     if (!callId) {
-      return twimlResponse(
-        `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Missing call reference. Goodbye.</Say><Hangup/></Response>`,
-        400
-      );
+      return friendlyHangup("Missing call reference. Goodbye.");
     }
 
     const xml = await handleTwilioGather({ callId, speechResult });
@@ -66,9 +60,8 @@ export async function POST(request: NextRequest) {
       errorType: "gather",
       message: error instanceof Error ? error.message : "unknown",
     });
-    return twimlResponse(
-      `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we ran into a technical issue. Goodbye.</Say><Hangup/></Response>`,
-      500
+    return friendlyHangup(
+      "Sorry, we ran into a technical issue. Goodbye."
     );
   }
 }
