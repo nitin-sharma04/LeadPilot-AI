@@ -54,6 +54,11 @@ assert(
 assert(!REALTIME_HUMAN_SDR_PROMPT.includes("Certainly. Wonderful."), "no rigid fillers");
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("[EVENT:call_answered]"), "opening event in prompt");
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("Do not force an acknowledgement"), "no forced ack");
+assert(REALTIME_HUMAN_SDR_PROMPT.includes("Never repeat or reword"), "prompt B anti-repeat");
+assert(
+  !REALTIME_HUMAN_SDR_PROMPT.includes("MEETING_INTENT → COLLECT_DATE"),
+  "no robotic appointment stage machine in spoken prompt"
+);
 
 // 3 smart transcription config present in gemini-live
 const geminiSrc = readFileSync(

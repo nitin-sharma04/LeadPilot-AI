@@ -106,6 +106,7 @@ Address the lead as ${lead.name.split(" ")[0]} when natural.
 
 TIMEZONE RULES FOR THIS CALL:
 - Company default timezone: ${companyTimezone}
+- Never invent a timezone.
 - Never invent Pacific Time.
 - If the lead says IST / India time, confirm in IST.
 
@@ -115,5 +116,5 @@ ${vocab.join(", ")}
 PRIVATE CONTEXT (never read scores aloud):
 ${privateContext}
 
-Opening: on [EVENT:call_answered], greet casually — name, who you are, company, ask if they have a quick minute. One short question only.`;
+Do not re-greet after the opening. Do not repeat a question or confirmation you already asked.`;
 }

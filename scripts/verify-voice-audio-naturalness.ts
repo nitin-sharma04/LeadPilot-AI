@@ -176,7 +176,11 @@ assert(upsample8kTo16k(new Int16Array(160)).length === 320, "upsample 8→16");
 
 // --- Prompt naturalness ---
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("Ask at most one question"), "one Q");
-assert(REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE"), "appt stages");
+assert(
+  REALTIME_HUMAN_SDR_PROMPT.includes("ask for a day") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("Missing date"),
+  "appt stages"
+);
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("[EVENT:call_answered]"), "opening event");
 assert(REALTIME_HUMAN_SDR_PROMPT.includes("contractions"), "contractions");
 assert(!REALTIME_HUMAN_SDR_PROMPT.includes("Never sound like an AI assistant"), "no identity claim as primary");

@@ -185,7 +185,11 @@ clearGatherCallState(callId);
 }
 
 // --- Prompt + voice ---
-assert(REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE"), "prompt stages");
+assert(
+  REALTIME_HUMAN_SDR_PROMPT.includes("ask for a day") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("Missing date"),
+  "prompt stages"
+);
 assert(
   REALTIME_HUMAN_SDR_PROMPT.includes("thoda slow") ||
     REALTIME_HUMAN_SDR_PROMPT.includes("slow down"),

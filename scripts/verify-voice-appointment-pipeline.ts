@@ -149,8 +149,11 @@ const prompts = readFileSync(
   path.join(root, "voice-server/src/prompts.ts"),
   "utf8"
 );
-assert(prompts.includes("Never invent a timezone"), "prompt no invent tz");
-assert(prompts.includes("SYSTEM booking success"), "prompt system gate");
+assert(prompts.includes("[INTERNAL] booking_ok"), "prompt system gate");
+assert(prompts.includes("NEVER say booked"), "prompt no false booking");
+const dbSrc = readFileSync(path.join(root, "voice-server/src/db.ts"), "utf8");
+assert(dbSrc.includes("Never invent a timezone"), "runtime timezone guard");
+assert(!dbSrc.includes("Opening: on [EVENT:call_answered]"), "no duplicate opening instruction");
 
 const streamHandler = readFileSync(
   path.join(root, "voice-server/src/twilio-stream-handler.ts"),
