@@ -3,6 +3,7 @@ import {
   isVoiceAudioDebugEnabled,
   logVoiceAudioStats,
   mulaw8kToPcm16kBase64,
+  mulawBase64Rms,
   parsePcmSampleRate,
   StreamingGeminiAudioPipeline,
 } from "./audio.js";
@@ -12,7 +13,7 @@ import {
 } from "./appointment-api.js";
 import { AppointmentIntentTracker } from "./appointment-intent-tracker.js";
 import { CallEndController } from "./call-end-controller.js";
-import { getLiveModel, getMaxCallDurationSeconds, getVadSilenceMs, resolveGeminiLiveVoice } from "./config.js";
+import { getLiveModel, getMaxCallDurationSeconds, getVadSilenceMs, getVadEndSensitivity, getVadPrefixPaddingMs, getPostSpeechGuardMs, getBargeInMinSpeechMs, getInputFinalizeDebounceMs, getEchoRmsThreshold, resolveGeminiLiveVoice } from "./config.js";
 import { buildSystemInstruction, noteCallEndReason, validateStreamSession } from "./db.js";
 import {
   detectsAgentFarewell,
@@ -27,7 +28,7 @@ import {
   type SpeechPace,
 } from "./speech-pace.js";
 import { TranscriptFinalizer } from "./transcript-finalizer.js";
-import { isInternalTranscript } from "./transcript-cleanup.js";
+import { isInternalTranscript, mergeStreamingTranscript } from "./transcript-cleanup.js";
 import { completeTwilioCall } from "./twilio-hangup.js";
 import {
   DeepgramTtsError,
@@ -48,7 +49,9 @@ import {
   logVoiceLatency,
 } from "./voice-latency.js";
 import {
+  isAmbiguousLeadFinished,
   isFinalizedLeadTranscript,
+  LeadUtteranceAssembler,
   VoiceTurnController,
 } from "./voice-turn-state.js";
 
@@ -99,6 +102,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   let agentSpokenThisTurn = false;
   let latency = emptyVoiceLatencyMarks();
   const turns = new VoiceTurnController();
+  const leadAssembler = new LeadUtteranceAssembler();
+  let inputFinalizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let playbackWatchdog: ReturnType<typeof setTimeout> | null = null;
+  let playbackMarkName: string | null = null;
+  let inboundLoudMs = 0;
+  let lastPlaybackGenerationId: number | null = null;
   /**
    * [INTERNAL] coaching / booking / pace notes. Sending clientContent while Gemini is
    * generating aborts that generation (surfaces as interrupted) and can stall the turn.
@@ -114,19 +123,39 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     leadText: string | null;
     responseStarted: boolean;
     reason: string;
+    generationId?: number;
+    state?: string;
   }) => {
     console.info("[voice-turn]", {
       callId,
       turnId: input.turnId,
+      generationId: input.generationId ?? turns.generationId,
+      state: input.state ?? turns.phase,
       leadText: input.leadText,
       responseStarted: input.responseStarted,
       reason: input.reason,
       epoch: turns.epoch,
     });
+    console.info("[turn]", {
+      callId,
+      turnId: input.turnId,
+      generationId: input.generationId ?? turns.generationId,
+      state: input.state ?? turns.phase,
+    });
   };
 
-  const geminiIdle = () =>
-    !turns.responseGenerationInFlight && !turns.ttsInFlight && !deepgramTurnInFlight;
+  const geminiIdle = () => {
+    const now = Date.now();
+    turns.enterListeningIfGuardElapsed(now);
+    return (
+      !turns.awaitingResponse &&
+      !turns.responseGenerationInFlight &&
+      !turns.ttsInFlight &&
+      !deepgramTurnInFlight &&
+      !turns.isAiSpeaking &&
+      !turns.isInPostSpeechGuard(now)
+    );
+  };
 
   const flushNotesIfIdle = () => {
     if (!gemini || !pendingNotes.length || !geminiIdle()) return;
@@ -141,6 +170,179 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     if (pendingNotes[pendingNotes.length - 1] === compact) return;
     pendingNotes.push(compact);
     flushNotesIfIdle();
+  };
+
+  const clearInputFinalizeTimer = () => {
+    if (inputFinalizeTimer) {
+      clearTimeout(inputFinalizeTimer);
+      inputFinalizeTimer = null;
+    }
+  };
+
+  const clearPlaybackWatchdog = () => {
+    if (playbackWatchdog) {
+      clearTimeout(playbackWatchdog);
+      playbackWatchdog = null;
+    }
+  };
+
+  const completePlayback = (generationId: number, why: string) => {
+    if (lastPlaybackGenerationId === generationId) return;
+    if (!turns.isGenerationCurrent(generationId)) {
+      console.info("[voice-stale]", {
+        callId,
+        generationId,
+        action: "discard",
+        reason: `stale_playback_${why}`,
+      });
+      return;
+    }
+    lastPlaybackGenerationId = generationId;
+    clearPlaybackWatchdog();
+    const guardMs = getPostSpeechGuardMs();
+    turns.markPlaybackComplete(Date.now(), guardMs, generationId);
+    console.info("[voice-playback]", {
+      callId,
+      generationId,
+      playbackCompleted: true,
+      reason: why,
+      guardMs,
+    });
+    console.info("[playback]", {
+      callId,
+      generationId,
+      markReceived: why === "twilio_mark",
+      completed: true,
+    });
+    setTimeout(() => {
+      turns.enterListeningIfGuardElapsed(Date.now());
+      flushNotesIfIdle();
+    }, guardMs + 10);
+  };
+
+  const sendPlaybackMark = (generationId: number) => {
+    if (!streamSid || twilioWs.readyState !== twilioWs.OPEN) return null;
+    markCounter += 1;
+    const name = `play_${generationId}_${markCounter}`;
+    playbackMarkName = name;
+    twilioWs.send(
+      JSON.stringify({
+        event: "mark",
+        streamSid,
+        mark: { name },
+      })
+    );
+    console.info("[voice-playback]", {
+      callId,
+      generationId,
+      playbackStarted: true,
+      mark: name,
+    });
+    console.info("[playback]", {
+      callId,
+      generationId,
+      started: true,
+    });
+    return name;
+  };
+
+  const applyGenuineBargeIn = (why: string) => {
+    const oldGenerationId = turns.generationId;
+    const barge = turns.onBargeIn();
+    console.info("[voice-barge-in]", {
+      callId,
+      generationId: barge.generationId,
+      epoch: barge.epoch,
+      cancelTts: barge.cancelTts,
+      reason: why,
+    });
+    console.info("[barge-in]", {
+      callId,
+      oldGenerationId,
+      newTurnId: turns.currentLeadTurnId,
+      generationId: barge.generationId,
+    });
+    console.info("[generation]", {
+      callId,
+      generationId: oldGenerationId,
+      cancelled: true,
+      reason: why,
+    });
+    logVoiceTurn({
+      turnId: turns.currentLeadTurnId,
+      leadText: leadAssembler.peek() || null,
+      responseStarted: false,
+      reason: "barge_in",
+      generationId: barge.generationId,
+      state: "user_speaking",
+    });
+    clearPlaybackWatchdog();
+    lastPlaybackGenerationId = null;
+    clearOutboundAudio();
+    finalizer?.discardAgentBuffer();
+    lastDeepgramSpoken = null;
+    agentSpokenThisTurn = false;
+    skipNextAgentSpeak = false;
+    latency = emptyVoiceLatencyMarks();
+    inboundLoudMs = 0;
+    return barge;
+  };
+
+  const scheduleLeadDebounce = () => {
+    clearInputFinalizeTimer();
+    const wait = getInputFinalizeDebounceMs();
+    inputFinalizeTimer = setTimeout(() => {
+      inputFinalizeTimer = null;
+      const now = Date.now();
+      turns.enterListeningIfGuardElapsed(now);
+      if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) return;
+      if (!leadAssembler.shouldDebounceFinalize(now, wait)) return;
+      const text = leadAssembler.take();
+      if (!text) return;
+      processFinalLeadTurn(text);
+    }, wait);
+  };
+
+  const ingestLeadTranscript = (
+    text: string,
+    meta?: { finished?: boolean }
+  ) => {
+    if (endController?.isEnding) return;
+    if (isInternalTranscript(text)) return;
+    const now = Date.now();
+    turns.enterListeningIfGuardElapsed(now);
+    leadAssembler.push(text, meta, now, mergeStreamingTranscript);
+    turns.noteLeadActivity();
+    finalizer?.appendLead(text);
+
+    const peeked = leadAssembler.peek();
+    const words = peeked.split(/\s+/).filter(Boolean).length;
+    const minSpeech = getBargeInMinSpeechMs();
+
+    if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) {
+      const substantial =
+        words >= 2 || inboundLoudMs >= minSpeech || isFinalizedLeadTranscript(meta);
+      if (!substantial) {
+        if (isFinalizedLeadTranscript(meta) && words < 1) return;
+        scheduleLeadDebounce();
+        return;
+      }
+      if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) {
+        applyGenuineBargeIn("lead_speech_during_playback");
+      }
+    }
+
+    if (isFinalizedLeadTranscript(meta)) {
+      clearInputFinalizeTimer();
+      const finalText = leadAssembler.take();
+      if (finalText) processFinalLeadTurn(finalText);
+      return;
+    }
+    if (isAmbiguousLeadFinished(meta)) {
+      scheduleLeadDebounce();
+    } else {
+      clearInputFinalizeTimer();
+    }
   };
 
   const tryBookOnLeadConfirmation = async (leadText: string) => {
@@ -308,9 +510,21 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         leadText: turns.lastFinalizedLead,
         responseStarted: false,
         reason: ttsGate.reason,
+        generationId: ttsGate.generationId,
       });
       return false;
     }
+    console.info("[voice-tts]", {
+      callId,
+      generationId: ttsGate.generationId,
+      ttsStarted: true,
+      turnId: ttsGate.turnId,
+    });
+    console.info("[tts]", {
+      callId,
+      generationId: ttsGate.generationId,
+      started: true,
+    });
     if (opts?.replace && deepgramTurnInFlight) {
       deepgramSession?.interrupt();
       deepgramTurnInFlight = false;
@@ -330,6 +544,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     const session = deepgramSession;
     ttsEpoch += 1;
     const myEpoch = ttsEpoch;
+    const audioEpoch = ttsGate.epoch;
+    const myGenerationId = ttsGate.generationId;
     deepgramTurnInFlight = true;
     lastDeepgramSpoken = speakable;
     latency.deepgramFirstAudioAt = null;
@@ -338,8 +554,21 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     const wallStart = Date.now();
 
     try {
-      for await (const chunk of session.synthesizeMulaw8k(speakable)) {
-        if (session.cancelled) return false;
+      for await (const chunk of session.synthesizeMulaw8k(
+        speakable,
+        turns.ttsAbortSignal
+      )) {
+        if (session.cancelled || turns.ttsAbortSignal.aborted) {
+          console.info("[tts]", {
+            callId,
+            generationId: myGenerationId,
+            cancelled: true,
+            discarded: true,
+          });
+          return false;
+        }
+        if (!turns.isAudioEpochCurrent(audioEpoch)) return false;
+        if (!turns.isGenerationCurrent(myGenerationId)) return false;
         if (endController && !endController.shouldAcceptOutboundAudio) return false;
         if (latency.deepgramFirstAudioAt === null) {
           latency.deepgramFirstAudioAt = Date.now();
@@ -372,7 +601,26 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         firstTwilioFrameMs,
       });
       logVoiceLatency(callId, latency);
-      return Boolean(timing && timing.totalAudioBytes > 0);
+      const played = Boolean(timing && timing.totalAudioBytes > 0);
+      if (played && myEpoch === ttsEpoch && turns.isGenerationCurrent(myGenerationId)) {
+        sendPlaybackMark(myGenerationId);
+        const durationMs = Math.round((timing?.totalAudioBytes || 0) / 8);
+        clearPlaybackWatchdog();
+        playbackWatchdog = setTimeout(() => {
+          completePlayback(myGenerationId, "watchdog");
+        }, Math.max(400, durationMs + 300));
+      } else if (
+        !session.cancelled &&
+        turns.isGenerationCurrent(myGenerationId)
+      ) {
+        completePlayback(myGenerationId, "tts_empty");
+      }
+      console.info("[voice-tts]", {
+        callId,
+        generationId: myGenerationId,
+        ttsCompleted: played,
+      });
+      return played;
     } catch (error) {
       if (session.cancelled) return false;
       console.error("[deepgram-tts] synthesize failed", {
@@ -380,12 +628,17 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         errorType: error instanceof DeepgramTtsError ? error.name : "error",
         message: error instanceof Error ? error.message : "unknown",
       });
+      if (turns.isGenerationCurrent(myGenerationId)) {
+        completePlayback(myGenerationId, "tts_error");
+      }
       return false;
     } finally {
       if (myEpoch === ttsEpoch) {
         deepgramTurnInFlight = false;
         turns.endTts();
-        flushNotesIfIdle();
+        if (!turns.isAiSpeaking) {
+          flushNotesIfIdle();
+        }
       }
     }
   };
@@ -460,10 +713,31 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         leadText: turns.lastFinalizedLead,
         responseStarted: false,
         reason: finalized.reason,
+        generationId: finalized.generationId,
       });
       return;
     }
 
+    if (finalized.cancelledPrevious) {
+      cancelDeepgramTts();
+      clearOutboundAudio();
+      gemini?.discardStaleOutput();
+      console.info("[generation]", {
+        callId,
+        generationId: finalized.cancelledGenerationId,
+        cancelled: true,
+        stale: true,
+        reason: "latest_turn_wins",
+      });
+      console.info("[barge-in]", {
+        callId,
+        oldGenerationId: finalized.cancelledGenerationId,
+        newTurnId: finalized.turnId,
+        generationId: finalized.generationId,
+      });
+    }
+
+    finalizer?.discardAgentBuffer();
     agentSpokenThisTurn = false;
     latency = emptyVoiceLatencyMarks();
     latency.leadFinalAt = Date.now();
@@ -474,6 +748,25 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       leadText: turns.lastFinalizedLead,
       responseStarted: false,
       reason: "lead_finalized",
+      generationId: finalized.generationId,
+      state: "user_turn_ended",
+    });
+    console.info("[voice-turn]", {
+      callId,
+      turnId: finalized.turnId,
+      generationId: finalized.generationId,
+      inputFinalized: turns.lastFinalizedLead,
+    });
+    console.info("[generation]", {
+      callId,
+      generationId: finalized.generationId,
+      started: true,
+      turnId: finalized.turnId,
+    });
+    console.info("[input]", {
+      callId,
+      turnId: finalized.turnId,
+      final: turns.lastFinalizedLead,
     });
 
     if (detectsSlowSpeechRequest(leadText) && speechPace !== "slow") {
@@ -517,6 +810,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       clearTimeout(maxDurationTimer);
       maxDurationTimer = null;
     }
+    clearInputFinalizeTimer();
+    clearPlaybackWatchdog();
     cancelDeepgramTts();
     deepgramSession?.close();
     deepgramSession = null;
@@ -591,6 +886,11 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
 
     if (msg.event === "mark") {
       const name = msg.mark?.name || "";
+      if (name.startsWith("play_")) {
+        const gen = Number.parseInt(name.split("_")[1] || "", 10);
+        if (Number.isFinite(gen)) completePlayback(gen, "twilio_mark");
+        return;
+      }
       endController?.onTwilioMark(name);
       return;
     }
@@ -707,6 +1007,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
           // finalized text; Gemini audio is discarded below.
           responseModalities: ["AUDIO"],
           vadSilenceMs: getVadSilenceMs(),
+          vadPrefixPaddingMs: getVadPrefixPaddingMs(),
+          vadEndSensitivity: getVadEndSensitivity(),
           handlers: {
             onSetupComplete: () => {
               console.info("[voice-server] gemini live ready", {
@@ -715,9 +1017,17 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 voice,
                 ttsProvider,
                 vadSilenceMs: getVadSilenceMs(),
+                vadEndSensitivity: getVadEndSensitivity(),
+                postSpeechGuardMs: getPostSpeechGuardMs(),
               });
               if (turns.requestOpening()) {
                 gemini?.requestOpening();
+                console.info("[generation]", {
+                  callId,
+                  generationId: turns.generationId,
+                  started: true,
+                  reason: "opening",
+                });
               }
             },
             onAudioPcm24kBase64: (pcmB64, sampleRateHz) => {
@@ -766,52 +1076,119 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             },
             onInterrupted: () => {
               if (endController?.isEnding) return;
-              const barge = turns.onBargeIn();
-              console.info("[voice-server] barge-in", {
-                callId,
-                ttsProvider,
-                cancelTts: barge.cancelTts,
-                epoch: barge.epoch,
-              });
-              clearOutboundAudio();
-              finalizer?.discardAgentBuffer();
-              lastDeepgramSpoken = null;
-              agentSpokenThisTurn = false;
-              skipNextAgentSpeak = false;
-              latency = emptyVoiceLatencyMarks();
+              const now = Date.now();
+              turns.enterListeningIfGuardElapsed(now);
+              const peeked = leadAssembler.peek();
+              const words = peeked.split(/\s+/).filter(Boolean).length;
+              const minSpeech = getBargeInMinSpeechMs();
+              if (
+                turns.isInPostSpeechGuard(now) &&
+                words < 2 &&
+                inboundLoudMs < minSpeech
+              ) {
+                console.info("[voice-stale]", {
+                  callId,
+                  generationId: turns.generationId,
+                  action: "ignore_echo_interrupt",
+                });
+                return;
+              }
+              if (
+                turns.isAiSpeaking &&
+                words < 1 &&
+                inboundLoudMs < minSpeech
+              ) {
+                console.info("[voice-stale]", {
+                  callId,
+                  generationId: turns.generationId,
+                  action: "ignore_tiny_interrupt",
+                });
+                return;
+              }
+              if (!turns.isAiSpeaking && !turns.isInPostSpeechGuard(now)) {
+                turns.noteLeadActivity();
+                return;
+              }
+              applyGenuineBargeIn("gemini_interrupted");
             },
             onInputTranscriptInterim: (text) => {
               if (endController?.isEnding) return;
               if (isInternalTranscript(text)) return;
               finalizer?.setInterimLead(text);
+              turns.noteLeadActivity();
             },
             onInputTranscript: (text, meta) => {
-              if (endController?.isEnding) return;
-              if (isInternalTranscript(text)) return;
-              finalizer?.appendLead(text);
-              if (!isFinalizedLeadTranscript(meta)) return;
-              processFinalLeadTurn(finalizer?.peekLead() || text);
+              ingestLeadTranscript(text, meta);
             },
             onOutputTranscript: (text) => {
+              const note = turns.noteModelOutput(text);
+              if (!note.accepted) {
+                console.info("[voice-stale]", {
+                  callId,
+                  generationId: turns.generationId,
+                  action: "discard",
+                  reason: note.reason,
+                });
+                return;
+              }
               finalizer?.appendAgent(text);
             },
             onGenerationComplete: () => {
+              const generationId = turns.generationId;
               void (async () => {
                 if (ttsProvider === "deepgram") {
                   if (endController?.isEnding && skipNextAgentSpeak) return;
-                  const peeked = finalizer?.peekAgent() || null;
+                  if (!turns.isGenerationCurrent(generationId)) {
+                    console.info("[generation]", {
+                      callId,
+                      generationId,
+                      stale: true,
+                      reason: "generation_complete_after_cancel",
+                    });
+                    return;
+                  }
+                  if (!turns.outputSeenForGeneration) {
+                    console.info("[generation]", {
+                      callId,
+                      generationId,
+                      stale: true,
+                      reason: "generation_complete_no_output",
+                    });
+                    return;
+                  }
+                  const peeked =
+                    (turns.aggregator?.text || finalizer?.peekAgent() || "").trim() ||
+                    null;
                   if (!toSpeakableAgentText(peeked)) return;
                   const gate = turns.tryAcceptModelResponse(
                     "generation_complete",
-                    peeked
+                    peeked,
+                    generationId
                   );
                   logVoiceTurn({
                     turnId: gate.turnId,
                     leadText: turns.lastFinalizedLead,
                     responseStarted: gate.accepted,
                     reason: gate.reason,
+                    generationId: gate.generationId,
                   });
-                  if (!gate.accepted) return;
+                  if (!gate.accepted) {
+                    if (gate.reason !== "response_already_accepted") {
+                      console.info("[voice-stale]", {
+                        callId,
+                        generationId: gate.generationId,
+                        action: "discard",
+                        reason: gate.reason,
+                      });
+                    }
+                    return;
+                  }
+                  console.info("[voice-turn]", {
+                    callId,
+                    turnId: gate.turnId,
+                    generationId: gate.generationId,
+                    generationCompleted: true,
+                  });
                   await prepareAndSpeakGeminiTurn(peeked);
                   return;
                 }
@@ -824,16 +1201,24 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
               })();
             },
             onTurnComplete: () => {
+              const generationId = turns.generationId;
               void (async () => {
                 latency.geminiTurnCompleteAt = Date.now();
                 if (endController?.isEnding) {
                   await finalizer?.flushLead();
                   if (ttsProvider === "deepgram") {
-                    const peeked = finalizer?.peekAgent() || null;
-                    if (toSpeakableAgentText(peeked)) {
+                    const peeked =
+                      (turns.aggregator?.text || finalizer?.peekAgent() || "").trim() ||
+                      null;
+                    if (
+                      toSpeakableAgentText(peeked) &&
+                      turns.outputSeenForGeneration &&
+                      turns.isGenerationCurrent(generationId)
+                    ) {
                       const endingGate = turns.tryAcceptModelResponse(
                         "turn_complete_ending",
-                        peeked
+                        peeked,
+                        generationId
                       );
                       if (endingGate.accepted) {
                         logVoiceTurn({
@@ -858,27 +1243,42 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 }
 
                 if (ttsProvider === "deepgram") {
-                  const peeked = finalizer?.peekAgent() || null;
-                  if (toSpeakableAgentText(peeked)) {
-                    const fallback = turns.tryAcceptModelResponse(
-                      "turn_complete_fallback",
-                      peeked
-                    );
-                    if (fallback.accepted) {
-                      logVoiceTurn({
-                        turnId: fallback.turnId,
-                        leadText: turns.lastFinalizedLead,
-                        responseStarted: true,
-                        reason: fallback.reason,
-                      });
-                      await prepareAndSpeakGeminiTurn(peeked);
-                    } else {
-                      logVoiceTurn({
-                        turnId: fallback.turnId,
-                        leadText: turns.lastFinalizedLead,
-                        responseStarted: false,
-                        reason: fallback.reason,
-                      });
+                  if (!turns.isGenerationCurrent(generationId) || !turns.outputSeenForGeneration) {
+                    logVoiceTurn({
+                      turnId: turns.currentLeadTurnId,
+                      leadText: turns.lastFinalizedLead,
+                      responseStarted: false,
+                      reason: !turns.outputSeenForGeneration
+                        ? "turn_complete_no_output"
+                        : "turn_complete_stale",
+                      generationId,
+                    });
+                  } else {
+                    const peeked =
+                      (turns.aggregator?.text || finalizer?.peekAgent() || "").trim() ||
+                      null;
+                    if (toSpeakableAgentText(peeked)) {
+                      const fallback = turns.tryAcceptModelResponse(
+                        "turn_complete_fallback",
+                        peeked,
+                        generationId
+                      );
+                      if (fallback.accepted) {
+                        logVoiceTurn({
+                          turnId: fallback.turnId,
+                          leadText: turns.lastFinalizedLead,
+                          responseStarted: true,
+                          reason: fallback.reason,
+                        });
+                        await prepareAndSpeakGeminiTurn(peeked);
+                      } else {
+                        logVoiceTurn({
+                          turnId: fallback.turnId,
+                          leadText: turns.lastFinalizedLead,
+                          responseStarted: false,
+                          reason: fallback.reason,
+                        });
+                      }
                     }
                   }
                 } else {
@@ -932,7 +1332,19 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       if (!payload || !gemini) return;
       if (msg.media?.track && msg.media.track !== "inbound") return;
       if (endController && !endController.shouldAcceptGeminiInput) return;
+      const now = Date.now();
+      turns.enterListeningIfGuardElapsed(now);
       try {
+        if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) {
+          const rms = mulawBase64Rms(payload);
+          if (rms < getEchoRmsThreshold()) {
+            inboundLoudMs = Math.max(0, inboundLoudMs - 20);
+            return;
+          }
+          inboundLoudMs += 20;
+        } else {
+          inboundLoudMs = 0;
+        }
         const pcm16k = mulaw8kToPcm16kBase64(payload);
         gemini.sendPcm16kBase64(pcm16k);
       } catch {
@@ -957,6 +1369,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       clearTimeout(maxDurationTimer);
       maxDurationTimer = null;
     }
+    clearInputFinalizeTimer();
+    clearPlaybackWatchdog();
     void finalizer?.flushAll();
     gemini?.close();
   });

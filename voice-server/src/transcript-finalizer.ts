@@ -104,6 +104,12 @@ export class TranscriptFinalizer {
     return cleaned;
   }
 
+  /** Drop incomplete lead speech after a stale/barge-in reset. */
+  discardLeadBuffer() {
+    this.leadBuf = "";
+    this.interimLead = "";
+  }
+
   async flushAll() {
     await this.flushLead();
     await this.flushAgent();

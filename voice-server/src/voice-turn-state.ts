@@ -1,37 +1,182 @@
 /**
- * Per-call turn and TTS gates for the production Twilio path.
- * One finalized lead utterance → one model response → one TTS synthesis.
+ * Production Twilio turn machine.
  *
- * Proven in Voice Lab (not imported from voice-lab/):
- *  - Gemini Live often omits inputTranscription.finished on a complete utterance
- *  - duplicate generationComplete must not TTS the opening twice
- *  - barge-in bumps epoch so stale audio never resumes
+ * IDLE/LISTENING → USER_SPEAKING → USER_TURN_ENDED → AI_THINKING → AI_SPEAKING
+ * → POST_SPEECH_GUARD → LISTENING
+ *
+ * One finalized lead turn → one generation id → one TTS → one playback.
+ * Stale Gemini events (generationComplete / turnComplete / leftover text)
+ * must never speak after a newer user turn or barge-in.
  */
+
+export type VoiceTurnPhase =
+  | "idle"
+  | "listening"
+  | "user_speaking"
+  | "user_turn_ended"
+  | "ai_thinking"
+  | "ai_speaking"
+  | "post_speech_guard";
 
 export type VoiceTurnAcceptResult = {
   accepted: boolean;
   turnId: number;
   reason: string;
   epoch: number;
+  generationId: number;
+  cancelledPrevious?: boolean;
+  cancelledGenerationId?: number | null;
 };
+
+export type ResponseStatus =
+  | "generating"
+  | "finalized"
+  | "tts_started"
+  | "playing"
+  | "completed"
+  | "cancelled";
+
+/** One Gemini generation → one aggregated response. Latest turn wins. */
+export class ResponseAggregator {
+  status: ResponseStatus = "generating";
+  text = "";
+  readonly generationId: number;
+  readonly turnId: number;
+  ttsRequestId: number | null = null;
+
+  constructor(generationId: number, turnId: number) {
+    this.generationId = generationId;
+    this.turnId = turnId;
+  }
+
+  append(chunk: string) {
+    if (this.status === "cancelled") return;
+    const next = chunk.replace(/\s+/g, " ").trim();
+    if (!next) return;
+    if (!this.text) this.text = next;
+    else if (next.startsWith(this.text) || next.includes(this.text)) this.text = next;
+    else if (this.text.includes(next)) return;
+    else this.text = `${this.text} ${next}`.trim();
+  }
+
+  finalize(): string | null {
+    if (this.status === "cancelled") return null;
+    const spoken = this.text.replace(/\s+/g, " ").trim();
+    if (!spoken) return null;
+    this.status = "finalized";
+    return spoken;
+  }
+
+  markTtsStarted(ttsRequestId: number) {
+    if (this.status === "cancelled") return false;
+    if (this.status === "tts_started" || this.status === "playing" || this.status === "completed") {
+      return false;
+    }
+    this.status = "tts_started";
+    this.ttsRequestId = ttsRequestId;
+    return true;
+  }
+
+  markPlaying() {
+    if (this.status === "cancelled") return false;
+    this.status = "playing";
+    return true;
+  }
+
+  markCompleted() {
+    if (this.status === "cancelled") return false;
+    this.status = "completed";
+    return true;
+  }
+
+  cancel() {
+    this.status = "cancelled";
+  }
+
+  get canEnterTts() {
+    return this.status === "finalized" || this.status === "generating";
+  }
+}
 
 function normalizeSpoken(text: string): string {
   return text.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-function spokenWordCount(text: string): number {
-  return text.split(/\s+/).filter(Boolean).length;
+export function responseTextHash(text: string): string {
+  return normalizeSpoken(text);
 }
 
 /**
- * `finished === false` is a true partial.
- * `finished === true` is final.
- * Missing `finished` is treated as a complete utterance (this Live model).
+ * Immediate finalize only when Gemini explicitly marks finished.
+ * `finished === false` is a partial.
+ * Missing `finished` is NOT immediately final — debounce in the handler.
  */
 export function isFinalizedLeadTranscript(
   meta?: { finished?: boolean } | null
 ): boolean {
-  return meta?.finished !== false;
+  return meta?.finished === true;
+}
+
+export function isPartialLeadTranscript(
+  meta?: { finished?: boolean } | null
+): boolean {
+  return meta?.finished === false;
+}
+
+export function isAmbiguousLeadFinished(
+  meta?: { finished?: boolean } | null
+): boolean {
+  return meta?.finished !== true && meta?.finished !== false;
+}
+
+/** Merge + debounce helper for Gemini input transcription (finished is unreliable). */
+export class LeadUtteranceAssembler {
+  buffer = "";
+  lastChunkAt = 0;
+  private lastPartial = false;
+
+  push(
+    text: string,
+    meta: { finished?: boolean } | undefined,
+    now: number,
+    merge: (buffer: string, chunk: string) => string
+  ) {
+    const chunk = text.replace(/\s+/g, " ").trim();
+    if (!chunk) return;
+    this.buffer = merge(this.buffer, chunk);
+    this.lastChunkAt = now;
+    this.lastPartial = isPartialLeadTranscript(meta);
+  }
+
+  peek(): string {
+    return this.buffer.replace(/\s+/g, " ").trim();
+  }
+
+  shouldFinalizeImmediately(meta?: { finished?: boolean } | null): boolean {
+    return isFinalizedLeadTranscript(meta) && Boolean(this.peek());
+  }
+
+  shouldDebounceFinalize(now: number, debounceMs: number): boolean {
+    if (this.lastPartial) return false;
+    const text = this.peek();
+    if (!text) return false;
+    if (now - this.lastChunkAt < debounceMs) return false;
+    return true;
+  }
+
+  take(): string {
+    const text = this.peek();
+    this.buffer = "";
+    this.lastPartial = false;
+    this.lastChunkAt = 0;
+    return text;
+  }
+
+  clear() {
+    this.buffer = "";
+    this.lastPartial = false;
+    this.lastChunkAt = 0;
+  }
 }
 
 export class VoiceTurnController {
@@ -43,101 +188,275 @@ export class VoiceTurnController {
   ttsAcceptedForTurn: number | null = null;
   lastFinalizedLead: string | null = null;
   lastFinalizedAgent: string | null = null;
-  /** Monotonic; bumped on barge-in. Stale TTS must not play. */
+  /** Bumped on barge-in / stale invalidate. Stale TTS must not play. */
   epoch = 0;
   openingRequested = false;
+  generationId = 0;
+  phase: VoiceTurnPhase = "idle";
+  awaitingResponse = false;
+  outputSeenForGeneration = false;
+  acceptedGenerationId: number | null = null;
+  spokenGenerationId: number | null = null;
+  ttsGenerationId: number | null = null;
+  playbackGenerationId: number | null = null;
+  responseHashForGeneration: string | null = null;
+  ignoreModelOutputUntilLead = false;
+  postSpeechGuardUntil = 0;
+  aiSpeaking = false;
+  responseAbort: AbortController = new AbortController();
+  ttsAbort: AbortController = new AbortController();
+  aggregator: ResponseAggregator | null = null;
+  ttsRequestSeq = 0;
 
   requestOpening(): boolean {
     if (this.openingRequested) return false;
     this.openingRequested = true;
+    this.beginGeneration("opening");
+    this.phase = "ai_thinking";
     return true;
+  }
+
+  private beginGeneration(_reason: "opening" | "lead" | "closing") {
+    this.generationId += 1;
+    this.awaitingResponse = true;
+    this.outputSeenForGeneration = false;
+    this.acceptedGenerationId = null;
+    this.spokenGenerationId = null;
+    this.ttsGenerationId = null;
+    this.playbackGenerationId = null;
+    this.responseHashForGeneration = null;
+    this.responseGenerationInFlight = false;
+    this.responseAcceptedForTurn = null;
+    this.ttsAcceptedForTurn = null;
+    this.ttsInFlight = false;
+    this.ignoreModelOutputUntilLead = false;
+    this.responseAbort = new AbortController();
+    this.ttsAbort = new AbortController();
+    this.aggregator = new ResponseAggregator(this.generationId, this.currentLeadTurnId);
+  }
+
+  /**
+   * ElevenLabs-style: a newer authoritative turn cancels in-flight response/TTS.
+   * AbortControllers fire so async LLM/TTS work cannot emit after this.
+   */
+  cancelActiveResponse(reason: string): {
+    cancelled: boolean;
+    oldGenerationId: number;
+    epoch: number;
+    reason: string;
+  } {
+    const oldGenerationId = this.generationId;
+    const cancelled = Boolean(
+      this.ttsInFlight ||
+        this.aiSpeaking ||
+        this.awaitingResponse ||
+        this.responseGenerationInFlight ||
+        (this.aggregator &&
+          this.aggregator.status !== "completed" &&
+          this.aggregator.status !== "cancelled")
+    );
+    try {
+      this.responseAbort.abort();
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.ttsAbort.abort();
+    } catch {
+      /* ignore */
+    }
+    this.aggregator?.cancel();
+    this.epoch += 1;
+    this.ttsInFlight = false;
+    this.ttsAcceptedForTurn = null;
+    this.responseGenerationInFlight = false;
+    this.awaitingResponse = false;
+    this.outputSeenForGeneration = false;
+    this.aiSpeaking = false;
+    this.postSpeechGuardUntil = 0;
+    return { cancelled, oldGenerationId, epoch: this.epoch, reason };
+  }
+
+  get ttsAbortSignal(): AbortSignal {
+    return this.ttsAbort.signal;
+  }
+
+  get responseAbortSignal(): AbortSignal {
+    return this.responseAbort.signal;
+  }
+
+  get hasActiveResponseWork(): boolean {
+    return (
+      this.ttsInFlight ||
+      this.aiSpeaking ||
+      this.awaitingResponse ||
+      this.responseGenerationInFlight
+    );
+  }
+
+  noteLeadActivity() {
+    if (this.phase === "listening" || this.phase === "idle" || this.phase === "post_speech_guard") {
+      this.phase = "user_speaking";
+    }
+    if (this.ignoreModelOutputUntilLead) {
+      this.ignoreModelOutputUntilLead = false;
+    }
+  }
+
+  noteModelOutput(chunk?: string): { accepted: boolean; reason: string } {
+    if (this.ignoreModelOutputUntilLead) {
+      return { accepted: false, reason: "stale_output_before_lead" };
+    }
+    if (!this.awaitingResponse) {
+      return { accepted: false, reason: "not_awaiting_response" };
+    }
+    this.outputSeenForGeneration = true;
+    if (chunk) this.aggregator?.append(chunk);
+    return { accepted: true, reason: "output_chunk" };
   }
 
   finalizeLeadTurn(text: string): VoiceTurnAcceptResult {
     const leadText = text.replace(/\s+/g, " ").trim();
     if (!leadText) {
-      return {
-        accepted: false,
-        turnId: this.currentLeadTurnId,
-        reason: "empty_lead",
-        epoch: this.epoch,
-      };
+      return this.reject("empty_lead");
     }
     if (this.leadTurnFinalized && this.lastFinalizedLead === leadText) {
-      return {
-        accepted: false,
-        turnId: this.currentLeadTurnId,
-        reason: "duplicate_final_lead",
-        epoch: this.epoch,
-      };
+      return this.reject("duplicate_final_lead");
     }
+    const previous = this.hasActiveResponseWork
+      ? this.cancelActiveResponse("latest_turn_wins")
+      : null;
     this.currentLeadTurnId += 1;
     this.leadTurnFinalized = true;
     this.lastFinalizedLead = leadText;
-    this.responseGenerationInFlight = false;
-    this.responseAcceptedForTurn = null;
-    this.ttsAcceptedForTurn = null;
+    this.beginGeneration("lead");
+    this.phase = "user_turn_ended";
     return {
       accepted: true,
       turnId: this.currentLeadTurnId,
       reason: "lead_finalized",
       epoch: this.epoch,
+      generationId: this.generationId,
+      cancelledPrevious: Boolean(previous?.cancelled),
+      cancelledGenerationId: previous?.oldGenerationId ?? null,
     };
   }
 
+  /**
+   * Accept the current generation once. `agentText` is optional polish;
+   * live Gemini chunks must already have been noted via noteModelOutput.
+   * Passing leftover text from a previous generation is not enough.
+   */
   tryAcceptModelResponse(
     reason: string,
-    agentText?: string | null
+    agentText?: string | null,
+    observedGenerationId?: number
   ): VoiceTurnAcceptResult {
     const turnId = this.currentLeadTurnId;
-    if (this.responseAcceptedForTurn === turnId) {
-      return {
-        accepted: false,
-        turnId,
-        reason: "response_already_accepted",
-        epoch: this.epoch,
-      };
+    const spoken = (agentText || this.aggregator?.text || "").replace(/\s+/g, " ").trim();
+
+    if (
+      observedGenerationId != null &&
+      observedGenerationId !== this.generationId
+    ) {
+      return this.reject("stale_generation");
+    }
+    if (!this.awaitingResponse) {
+      return this.reject("not_awaiting_response");
+    }
+    if (this.ignoreModelOutputUntilLead) {
+      return this.reject("stale_generation");
+    }
+    if (!this.outputSeenForGeneration) {
+      return this.reject("stale_or_no_output");
+    }
+    if (!spoken) {
+      return this.reject("stale_or_no_output");
+    }
+    if (this.acceptedGenerationId === this.generationId) {
+      return this.reject("response_already_accepted");
+    }
+    if (this.responseAcceptedForTurn === turnId && this.spokenGenerationId === this.generationId) {
+      return this.reject("response_already_accepted");
     }
     if (this.responseGenerationInFlight) {
-      return { accepted: false, turnId, reason: "response_in_flight", epoch: this.epoch };
+      return this.reject("response_in_flight");
     }
-    const spoken = (agentText || "").replace(/\s+/g, " ").trim();
     if (this.isEchoOfLastSpoken(spoken)) {
-      return {
-        accepted: false,
-        turnId,
-        reason: "duplicate_spoken_text",
-        epoch: this.epoch,
-      };
+      return this.reject("duplicate_spoken_text");
     }
+    if (spoken) {
+      const hash = responseTextHash(spoken);
+      if (
+        this.responseHashForGeneration === hash &&
+        this.acceptedGenerationId === this.generationId
+      ) {
+        return this.reject("duplicate_generation_hash");
+      }
+    }
+
     this.responseGenerationInFlight = true;
     this.responseAcceptedForTurn = turnId;
-    return { accepted: true, turnId, reason, epoch: this.epoch };
+    this.acceptedGenerationId = this.generationId;
+    this.spokenGenerationId = this.generationId;
+    this.awaitingResponse = false;
+    this.phase = "ai_thinking";
+    if (spoken) this.responseHashForGeneration = responseTextHash(spoken);
+    this.aggregator?.append(spoken);
+    this.aggregator?.finalize();
+    return {
+      accepted: true,
+      turnId,
+      reason,
+      epoch: this.epoch,
+      generationId: this.generationId,
+    };
+  }
+
+  /** Test/helper: record live model text, then accept this generation once. */
+  acceptLiveResponse(
+    text: string,
+    reason = "generation_complete"
+  ): VoiceTurnAcceptResult {
+    this.noteModelOutput(text);
+    return this.tryAcceptModelResponse(reason, text, this.generationId);
   }
 
   isEchoOfLastSpoken(text: string): boolean {
     const clean = text.replace(/\s+/g, " ").trim();
     if (!clean || !this.lastFinalizedAgent) return false;
-    if (normalizeSpoken(clean) !== normalizeSpoken(this.lastFinalizedAgent)) {
-      return false;
-    }
-    if (this.lastFinalizedLead === null) return true;
-    return spokenWordCount(clean) >= 8;
+    return normalizeSpoken(clean) === normalizeSpoken(this.lastFinalizedAgent);
   }
 
   tryBeginTts(turnId: number = this.currentLeadTurnId): VoiceTurnAcceptResult {
     if (this.ttsInFlight) {
       const same = this.ttsAcceptedForTurn === turnId;
-      return {
-        accepted: false,
-        turnId,
-        reason: same ? "tts_duplicate_same_turn" : "tts_in_flight",
-        epoch: this.epoch,
-      };
+      return this.reject(same ? "tts_duplicate_same_turn" : "tts_in_flight");
+    }
+    if (
+      this.ttsGenerationId === this.generationId &&
+      this.spokenGenerationId === this.generationId
+    ) {
+      return this.reject("tts_duplicate_same_generation");
     }
     this.ttsInFlight = true;
     this.ttsAcceptedForTurn = turnId;
-    return { accepted: true, turnId, reason: "tts_start", epoch: this.epoch };
+    this.ttsGenerationId = this.generationId;
+    this.aiSpeaking = true;
+    this.phase = "ai_speaking";
+    this.ttsRequestSeq += 1;
+    if (this.aggregator && !this.aggregator.markTtsStarted(this.ttsRequestSeq)) {
+      this.ttsInFlight = false;
+      this.aiSpeaking = false;
+      return this.reject("tts_duplicate_or_cancelled");
+    }
+    return {
+      accepted: true,
+      turnId,
+      reason: "tts_start",
+      epoch: this.epoch,
+      generationId: this.generationId,
+    };
   }
 
   endTts() {
@@ -145,15 +464,61 @@ export class VoiceTurnController {
     this.responseGenerationInFlight = false;
   }
 
+  markPlaybackComplete(now: number, guardMs: number, generationId?: number) {
+    if (generationId != null && generationId !== this.generationId) return;
+    if (this.aggregator?.status === "cancelled") return;
+    this.playbackGenerationId = this.generationId;
+    this.aiSpeaking = false;
+    this.ttsInFlight = false;
+    this.responseGenerationInFlight = false;
+    this.awaitingResponse = false;
+    this.postSpeechGuardUntil = now + Math.max(0, guardMs);
+    this.phase = guardMs > 0 ? "post_speech_guard" : "listening";
+    this.aggregator?.markCompleted();
+  }
+
+  isInPostSpeechGuard(now: number): boolean {
+    if (this.phase !== "post_speech_guard") return false;
+    if (now >= this.postSpeechGuardUntil) {
+      this.phase = "listening";
+      return false;
+    }
+    return true;
+  }
+
+  enterListeningIfGuardElapsed(now: number) {
+    if (this.phase === "post_speech_guard" && now >= this.postSpeechGuardUntil) {
+      this.phase = "listening";
+    }
+  }
+
+  get isAiSpeaking(): boolean {
+    return this.aiSpeaking || this.phase === "ai_speaking";
+  }
+
   get hasOpenGeneration(): boolean {
     return this.responseGenerationInFlight;
+  }
+
+  get isListeningIdle(): boolean {
+    return (
+      this.phase === "listening" ||
+      this.phase === "idle" ||
+      this.phase === "post_speech_guard"
+    );
   }
 
   /** Booking / hangup speech that must replace the current Gemini reply. */
   beginReplacementTts(): VoiceTurnAcceptResult {
     this.ttsInFlight = false;
     this.responseGenerationInFlight = false;
+    this.ttsGenerationId = null;
     this.responseAcceptedForTurn = this.currentLeadTurnId;
+    this.acceptedGenerationId = this.generationId;
+    this.spokenGenerationId = this.generationId;
+    this.awaitingResponse = false;
+    this.aggregator = new ResponseAggregator(this.generationId, this.currentLeadTurnId);
+    this.aggregator.status = "finalized";
     return this.tryBeginTts(this.currentLeadTurnId);
   }
 
@@ -161,27 +526,43 @@ export class VoiceTurnController {
   allowClosingResponse() {
     this.currentLeadTurnId += 1;
     this.leadTurnFinalized = true;
-    this.responseGenerationInFlight = false;
-    this.responseAcceptedForTurn = null;
-    this.ttsAcceptedForTurn = null;
+    this.beginGeneration("closing");
+    this.phase = "ai_thinking";
   }
 
-  onBargeIn(): { cancelTts: boolean; epoch: number } {
-    const cancelTts = this.ttsInFlight;
-    this.epoch += 1;
-    this.ttsInFlight = false;
-    this.ttsAcceptedForTurn = null;
-    this.responseGenerationInFlight = false;
+  onBargeIn(): { cancelTts: boolean; epoch: number; generationId: number } {
+    const cancelTts = this.ttsInFlight || this.aiSpeaking;
+    this.cancelActiveResponse("barge_in");
+    this.generationId += 1;
+    this.responseAbort = new AbortController();
+    this.ttsAbort = new AbortController();
+    this.aggregator = new ResponseAggregator(this.generationId, this.currentLeadTurnId);
     this.responseAcceptedForTurn = this.currentLeadTurnId;
     this.leadTurnFinalized = false;
-    return { cancelTts, epoch: this.epoch };
+    this.ignoreModelOutputUntilLead = true;
+    this.phase = "user_speaking";
+    return { cancelTts, epoch: this.epoch, generationId: this.generationId };
   }
 
   isAudioEpochCurrent(epoch: number): boolean {
     return epoch === this.epoch;
   }
 
+  isGenerationCurrent(generationId: number): boolean {
+    return generationId === this.generationId;
+  }
+
   noteAgentSpoken(text: string) {
     this.lastFinalizedAgent = text.replace(/\s+/g, " ").trim();
+  }
+
+  private reject(reason: string): VoiceTurnAcceptResult {
+    return {
+      accepted: false,
+      turnId: this.currentLeadTurnId,
+      reason,
+      epoch: this.epoch,
+      generationId: this.generationId,
+    };
   }
 }

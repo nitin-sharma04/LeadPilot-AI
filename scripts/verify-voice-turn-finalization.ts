@@ -90,20 +90,20 @@ function applyLeadChunks(
 {
   const turns = new VoiceTurnController();
   turns.finalizeLeadTurn("I just want more clients.");
-  const first = turns.tryAcceptModelResponse("generation_complete");
+  const first = turns.acceptLiveResponse("What are you hoping to improve?");
   const second = turns.tryAcceptModelResponse("generation_complete");
   const third = turns.tryAcceptModelResponse("turn_complete_fallback");
   assert(first.accepted, "T4 first response accepted");
   assert(!second.accepted, "T4 duplicate generationComplete rejected");
   assert(!third.accepted, "T4 turnComplete does not start a second response");
-  assert(second.reason === "response_already_accepted", "T4 reason");
+  assert(second.reason === "response_already_accepted" || second.reason === "not_awaiting_response", "T4 reason");
 }
 
 // 5–6. Duplicate output transcription / generationComplete does not produce duplicate TTS
 {
   const turns = new VoiceTurnController();
   turns.finalizeLeadTurn("Tuesday.");
-  const gen = turns.tryAcceptModelResponse("generation_complete");
+  const gen = turns.acceptLiveResponse("Tuesday works.");
   assert(gen.accepted, "T5 accept generation");
   const tts1 = turns.tryBeginTts();
   const tts2 = turns.tryBeginTts();
@@ -117,7 +117,7 @@ function applyLeadChunks(
 {
   const turns = new VoiceTurnController();
   turns.finalizeLeadTurn("Around 8 PM.");
-  turns.tryAcceptModelResponse("generation_complete");
+  turns.acceptLiveResponse("Eight works.");
   const a = turns.tryBeginTts();
   const b = turns.tryBeginTts();
   assert(a.accepted && a.reason === "tts_start", "T7 start");
@@ -132,21 +132,22 @@ function applyLeadChunks(
 {
   const turns = new VoiceTurnController();
   turns.finalizeLeadTurn("Hello.");
-  turns.tryAcceptModelResponse("generation_complete");
+  turns.acceptLiveResponse("Hey — got a minute?");
   turns.tryBeginTts();
   const barge = turns.onBargeIn();
   assert(barge.cancelTts, "T8 cancel TTS");
   assert(!turns.ttsInFlight, "T8 tts not in flight");
-  const stale = turns.tryAcceptModelResponse("generation_complete");
+  const stale = turns.tryAcceptModelResponse("generation_complete", "Hey — got a minute?");
   assert(!stale.accepted, "T8 stale Gemini callback ignored");
   const next = turns.finalizeLeadTurn("I just want more clients.");
   assert(next.accepted, "T8 new lead turn after barge-in");
-  const fresh = turns.tryAcceptModelResponse("generation_complete");
+  const fresh = turns.acceptLiveResponse("We can help you get more clients.");
   assert(fresh.accepted, "T8 new response after new lead");
   assert(handler.includes("onInterrupted"), "T8 interrupt handler");
+  assert(handler.includes("applyGenuineBargeIn"), "T8 genuine barge-in helper");
+  assert(handler.includes("clearOutboundAudio()"), "T8 clears Twilio audio");
   const bargeSrc = handler.slice(handler.indexOf("onInterrupted"));
-  assert(bargeSrc.includes("clearOutboundAudio()"), "T8 clears Twilio audio");
-  assert(bargeSrc.includes("turns.onBargeIn()"), "T8 uses barge-in gate");
+  assert(bargeSrc.includes("applyGenuineBargeIn"), "T8 uses barge-in helper");
 }
 
 // 9. Partial tomorrow / partial time does not advance appointment state
@@ -193,17 +194,17 @@ function applyLeadChunks(
   assert(handler.includes("beginEndFlow"), "T12 end flow");
 }
 
-// 13. Missing `finished` flag is treated as a complete utterance (this Live model)
+// 13. Missing `finished` is NOT immediately final (debounce in handler / assembler)
 {
   const tracker = new AppointmentIntentTracker();
   const turns = new VoiceTurnController();
   const { finals, noteLeadCalls } = applyLeadChunks(tracker, turns, [
     { text: "Yeah, what's this about?" },
   ]);
-  assert(finals.length === 1, "T13 undefined finished is final");
-  assert(noteLeadCalls.length === 1, "T13 noteLead once");
-  assert(isFinalizedLeadTranscript(undefined), "T13 undefined meta is final");
-  assert(isFinalizedLeadTranscript({}), "T13 empty meta is final");
+  assert(finals.length === 0, "T13 undefined finished is not immediate");
+  assert(noteLeadCalls.length === 0, "T13 no noteLead until debounce/true");
+  assert(!isFinalizedLeadTranscript(undefined), "T13 undefined meta is not immediate final");
+  assert(!isFinalizedLeadTranscript({}), "T13 empty meta is not immediate final");
   assert(isFinalizedLeadTranscript({ finished: true }), "T13 true is final");
   assert(!isFinalizedLeadTranscript({ finished: false }), "T13 false is partial");
 }
@@ -214,7 +215,7 @@ function applyLeadChunks(
   assert(turns.requestOpening(), "T14 first opening accepted");
   assert(!turns.requestOpening(), "T14 second opening ignored");
   const greeting = "Hey Nitin, it's John from ABC. Got a quick minute?";
-  const first = turns.tryAcceptModelResponse("generation_complete", greeting);
+  const first = turns.acceptLiveResponse(greeting);
   assert(first.accepted, "T14 first greeting accepted");
   turns.tryBeginTts();
   turns.noteAgentSpoken(greeting);
@@ -222,15 +223,16 @@ function applyLeadChunks(
   const dup = turns.tryAcceptModelResponse("generation_complete", greeting);
   assert(!dup.accepted, "T14 duplicate greeting rejected");
   assert(
-    dup.reason === "response_already_accepted" || dup.reason === "duplicate_spoken_text",
+    dup.reason === "response_already_accepted" ||
+      dup.reason === "duplicate_spoken_text" ||
+      dup.reason === "not_awaiting_response",
     `T14 reason ${dup.reason}`
   );
   const next = turns.finalizeLeadTurn("Yeah, what's this about?");
   assert(next.accepted, "T14 user turn after greeting");
-  const echo = turns.tryAcceptModelResponse("generation_complete", greeting);
+  const echo = turns.acceptLiveResponse(greeting);
   assert(!echo.accepted && echo.reason === "duplicate_spoken_text", "T14 greeting echo on new turn dropped");
-  const reply = turns.tryAcceptModelResponse(
-    "generation_complete",
+  const reply = turns.acceptLiveResponse(
     "We help teams follow up on leads automatically."
   );
   assert(reply.accepted, "T14 real reply accepted");
@@ -240,7 +242,7 @@ function applyLeadChunks(
 {
   const turns = new VoiceTurnController();
   turns.finalizeLeadTurn("Hello.");
-  turns.tryAcceptModelResponse("generation_complete", "Here is a long explanation.");
+  turns.acceptLiveResponse("Here is a long explanation.");
   const tts = turns.tryBeginTts();
   const oldEpoch = tts.epoch;
   const barge = turns.onBargeIn();
@@ -269,8 +271,7 @@ function applyLeadChunks(
 {
   const turns = new VoiceTurnController();
   turns.requestOpening();
-  const g0 = turns.tryAcceptModelResponse(
-    "generation_complete",
+  const g0 = turns.acceptLiveResponse(
     "Hey Nitin, it's John from ABC. Got a quick minute?"
   );
   assert(g0.accepted, "T17 greeting");
@@ -280,10 +281,7 @@ function applyLeadChunks(
   for (let i = 1; i <= 10; i++) {
     const f = turns.finalizeLeadTurn(`User line number ${i} with some words.`);
     assert(f.accepted, `T17 turn ${i} finalized`);
-    const r = turns.tryAcceptModelResponse(
-      "generation_complete",
-      `AI reply number ${i}, short and clear.`
-    );
+    const r = turns.acceptLiveResponse(`AI reply number ${i}, short and clear.`);
     assert(r.accepted, `T17 turn ${i} one response`);
     const dup = turns.tryAcceptModelResponse("generation_complete", `AI reply number ${i}, short and clear.`);
     assert(!dup.accepted, `T17 turn ${i} duplicate blocked`);
@@ -303,7 +301,7 @@ const geminiSrc = readFileSync(
 
 // Handler wiring: finished gate, no duplicate noteLead, one TTS path
 {
-  assert(handler.includes("isFinalizedLeadTranscript(meta)"), "finished meta used");
+  assert(handler.includes("ingestLeadTranscript"), "ingest path");
   assert(handler.includes("processFinalLeadTurn"), "final lead processor");
   const tryBook = handler.slice(
     handler.indexOf("const tryBookOnLeadConfirmation"),
@@ -321,11 +319,14 @@ const geminiSrc = readFileSync(
   assert(handler.includes("generation_complete"), "TTS from generationComplete");
   assert(handler.includes("deepgramTurnInFlight"), "deepgram flight flag");
   assert(handler.includes("tts_duplicate_ignored") || handler.includes("tryBeginTts"), "TTS gate");
-  assert(handler.includes("[voice-turn]"), "turn logs");
+  assert(handler.includes("getPostSpeechGuardMs"), "post-speech guard");
+  assert(handler.includes("not_awaiting_response") || handler.includes("awaitingResponse"), "no auto reply");
   assert(!/sleep\s*\(\s*\d+/.test(handler), "no response sleep");
   assert(handler.includes("queueNote"), "coaching notes queued");
   assert(handler.includes("flushNotesIfIdle"), "notes flushed when idle");
   assert(handler.includes("turns.requestOpening()"), "opening gated");
+  assert(handler.includes("outputSeenForGeneration"), "live Gemini output required before TTS");
+  assert(handler.includes("generation_complete_after_cancel"), "stale generationComplete discarded");
   assert(!/from ["'].*voice-lab/.test(handler), "production handler does not import voice-lab");
   assert(geminiSrc.includes("openingSent"), "Gemini opening is idempotent");
   assert(

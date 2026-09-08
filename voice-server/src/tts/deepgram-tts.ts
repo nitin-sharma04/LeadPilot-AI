@@ -80,6 +80,7 @@ export class DeepgramTtsSession {
   private live: WebSocket | null = null;
   private liveReady: Promise<boolean> | null = null;
   private turnSeq = 0;
+  private requestSeq = 0;
 
   constructor(config: DeepgramTtsConfig, client?: DeepgramClient) {
     this.config = config;
@@ -94,6 +95,7 @@ export class DeepgramTtsSession {
   interrupt() {
     this.cancelled = true;
     this.turnSeq += 1;
+    this.requestSeq += 1;
     try {
       this.restAbort?.abort();
     } catch {
@@ -180,23 +182,41 @@ export class DeepgramTtsSession {
    * Stream raw µ-law 8 kHz from Flux TTS.
    * WebSocket first; REST batch if the live socket is unavailable.
    */
-  async *synthesizeMulaw8k(text: string): AsyncGenerator<Buffer> {
+  async *synthesizeMulaw8k(
+    text: string,
+    signal?: AbortSignal
+  ): AsyncGenerator<Buffer> {
+    const requestId = ++this.requestSeq;
     this.cancelled = false;
-    const liveOk = await this.ensureLive();
-    if (liveOk && this.live && this.live.readyState === WebSocket.OPEN) {
-      try {
-        yield* this.synthesizeViaWebsocket(text);
+    const onAbort = () => this.interrupt();
+    if (signal) {
+      if (signal.aborted) {
+        this.interrupt();
         return;
-      } catch (error) {
-        if (this.cancelled) return;
-        console.warn("[deepgram-tts] websocket speak failed; falling back to REST", {
-          errorType: error instanceof Error ? error.name : "error",
-        });
-        this.live = null;
-        this.liveReady = null;
       }
+      signal.addEventListener("abort", onAbort, { once: true });
     }
-    yield* this.synthesizeViaRest(text);
+    try {
+      const liveOk = await this.ensureLive();
+      if (this.cancelled || this.requestSeq !== requestId || signal?.aborted) return;
+      if (liveOk && this.live && this.live.readyState === WebSocket.OPEN) {
+        try {
+          yield* this.synthesizeViaWebsocket(text);
+          return;
+        } catch (error) {
+          if (this.cancelled || this.requestSeq !== requestId || signal?.aborted) return;
+          console.warn("[deepgram-tts] websocket speak failed; falling back to REST", {
+            errorType: error instanceof Error ? error.name : "error",
+          });
+          this.live = null;
+          this.liveReady = null;
+        }
+      }
+      if (this.cancelled || this.requestSeq !== requestId || signal?.aborted) return;
+      yield* this.synthesizeViaRest(text);
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   private async *synthesizeViaWebsocket(text: string): AsyncGenerator<Buffer> {
@@ -305,6 +325,7 @@ export class DeepgramTtsSession {
 
     let result;
     this.restAbort = new AbortController();
+    const restId = this.requestSeq;
     try {
       result = await this.client.speak.v2.audio.generate(
         {
@@ -339,7 +360,7 @@ export class DeepgramTtsSession {
 
     try {
       for await (const chunk of nodeStream) {
-        if (this.cancelled) break;
+        if (this.cancelled || this.requestSeq !== restId) break;
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         if (!buf.length) continue;
         if (timing.firstAudioMs === null) {

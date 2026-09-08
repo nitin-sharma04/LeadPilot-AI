@@ -24,7 +24,9 @@ const nextConfig: NextConfig = {
       { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
       {
         key: "Permissions-Policy",
-        value: "camera=(), microphone=(), geolocation=()",
+        value: isProd
+          ? "camera=(), microphone=(), geolocation=()"
+          : "camera=(), geolocation=()",
       },
       { key: "X-Frame-Options", value: "SAMEORIGIN" },
     ];
@@ -49,6 +51,19 @@ const nextConfig: NextConfig = {
           { key: "Content-Security-Policy", value: "frame-ancestors *" },
         ],
       },
+      ...(!isProd
+        ? [
+            {
+              source: "/voice-lab",
+              headers: [
+                {
+                  key: "Permissions-Policy",
+                  value: "camera=(), microphone=(self), geolocation=()",
+                },
+              ],
+            },
+          ]
+        : []),
     ];
   },
 };

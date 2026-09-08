@@ -55,7 +55,7 @@ const gemini = readFileSync(
   assert(getVadSilenceMs("950") === 950, "950 allowed");
   assert(getVadSilenceMs("2000") === 1200, "clamp max 1200");
   assert(gemini.includes("silenceDurationMs: this.vadSilenceMs"), "live uses config");
-  assert(gemini.includes("END_SENSITIVITY_HIGH"), "faster end-of-speech");
+  assert(gemini.includes("endOfSpeechSensitivity: this.vadEndSensitivity"), "configurable end sensitivity");
 }
 
 {
@@ -77,12 +77,12 @@ const gemini = readFileSync(
   assert(marks.leadFinalAt === null, "empty marks");
 }
 
-// 3. No artificial response delay
+// 3. No artificial response delay (guards/debounce are not speech generators)
 {
   assert(!/sleep\s*\(\s*\d+/.test(handler), "no sleep delay");
-  assert(!/debounce/i.test(handler), "no debounce");
-  const delayHits = [...handler.matchAll(/setTimeout\(/g)];
-  assert(delayHits.length <= 2, `only hangup/max-duration timers, got ${delayHits.length}`);
+  assert(handler.includes("scheduleLeadDebounce"), "missing finished uses debounce, not instant final");
+  assert(handler.includes("getPostSpeechGuardMs"), "post-speech guard");
+  assert(!/setTimeout\(\s*\(\)\s*=>\s*gemini/.test(handler), "no delayed generation");
 }
 
 // 4. Deepgram first-byte streaming + cancel
@@ -107,8 +107,8 @@ const gemini = readFileSync(
 {
   assert(handler.includes("cancelDeepgramTts"), "cancel helper");
   assert(handler.includes("onInterrupted"), "interrupt handler");
-  const barge = handler.slice(handler.indexOf("onInterrupted"));
-  assert(barge.includes("clearOutboundAudio()"), "barge-in clears");
+  assert(handler.includes("applyGenuineBargeIn"), "genuine barge-in");
+  assert(handler.includes("clearOutboundAudio()"), "barge-in clears");
 }
 
 // 6–9. Transcript interim → final, no [unclear] from empty, no consecutive [unclear]

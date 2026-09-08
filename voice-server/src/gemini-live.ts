@@ -1,5 +1,7 @@
 import WebSocket from "ws";
 import {
+  getVadEndSensitivity,
+  getVadPrefixPaddingMs,
   getVadSilenceMs,
   resolveGeminiLiveVoice,
   type GeminiLiveVoice,
@@ -30,6 +32,8 @@ export type GeminiLiveSessionOptions = {
   /** AUDIO (default) or TEXT when an external TTS provider speaks. */
   responseModalities?: GeminiLiveResponseModality[];
   vadSilenceMs?: number;
+  vadPrefixPaddingMs?: number;
+  vadEndSensitivity?: "END_SENSITIVITY_HIGH" | "END_SENSITIVITY_LOW";
   handlers: GeminiLiveHandlers;
 };
 
@@ -55,6 +59,10 @@ export class GeminiLiveSession {
   private readonly handlers: GeminiLiveHandlers;
   private readonly responseModalities: GeminiLiveResponseModality[];
   private readonly vadSilenceMs: number;
+  private readonly vadPrefixPaddingMs: number;
+  private readonly vadEndSensitivity: "END_SENSITIVITY_HIGH" | "END_SENSITIVITY_LOW";
+  /** Prefer outputTranscription; ignore modelTurn text once transcription exists. */
+  private usedOutputTranscription = false;
 
   constructor(options: GeminiLiveSessionOptions) {
     this.apiKey = options.apiKey;
@@ -66,6 +74,9 @@ export class GeminiLiveSession {
       ? options.responseModalities
       : ["AUDIO"];
     this.vadSilenceMs = options.vadSilenceMs ?? getVadSilenceMs();
+    this.vadPrefixPaddingMs = options.vadPrefixPaddingMs ?? getVadPrefixPaddingMs();
+    this.vadEndSensitivity =
+      options.vadEndSensitivity ?? getVadEndSensitivity();
   }
 
   get selectedVoice(): GeminiLiveVoice {
@@ -135,8 +146,8 @@ export class GeminiLiveSession {
               automaticActivityDetection: {
                 disabled: false,
                 startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
-                endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-                prefixPaddingMs: 20,
+                endOfSpeechSensitivity: this.vadEndSensitivity,
+                prefixPaddingMs: this.vadPrefixPaddingMs,
                 silenceDurationMs: this.vadSilenceMs,
               },
             },
@@ -208,6 +219,7 @@ export class GeminiLiveSession {
     if (wasInterrupted) {
       this.dropOutboundAudio = true;
       this.awaitingFreshAudio = true;
+      this.usedOutputTranscription = false;
       this.handlers.onInterrupted();
     }
 
@@ -225,6 +237,7 @@ export class GeminiLiveSession {
     }
 
     if (serverContent.outputTranscription?.text) {
+      this.usedOutputTranscription = true;
       this.handlers.onOutputTranscript?.(
         serverContent.outputTranscription.text,
         { finished: serverContent.outputTranscription.finished }
@@ -233,7 +246,7 @@ export class GeminiLiveSession {
 
     const parts = serverContent.modelTurn?.parts ?? [];
     for (const part of parts) {
-      if (part.text) {
+      if (part.text && !this.usedOutputTranscription) {
         this.handlers.onOutputTranscript?.(part.text);
       }
       const data = part.inlineData?.data;
@@ -264,6 +277,7 @@ export class GeminiLiveSession {
       this.handlers.onGenerationComplete?.();
     }
     if (serverContent.turnComplete) {
+      this.usedOutputTranscription = false;
       this.handlers.onTurnComplete?.();
     }
   }
@@ -367,6 +381,16 @@ export class GeminiLiveSession {
         },
       })
     );
+  }
+
+  /**
+   * Drop in-flight Gemini native audio after a newer user turn wins.
+   * Does not close the Live socket.
+   */
+  discardStaleOutput() {
+    this.dropOutboundAudio = true;
+    this.awaitingFreshAudio = true;
+    this.usedOutputTranscription = false;
   }
 
   close() {

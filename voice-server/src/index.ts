@@ -8,9 +8,10 @@ import { handleTwilioMediaStream } from "./twilio-stream-handler.js";
 import { getLiveModel, resolveGeminiLiveVoice } from "./config.js";
 import { resolveVoiceTtsProvider } from "./tts/tts-provider.js";
 import { loadDeepgramTtsConfig } from "./tts/deepgram-tts.js";
+import { isVoiceLabEnabled } from "../../voice-lab/config.js";
+import { handleVoiceLabSocket } from "./voice-lab-handler.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Load repo-root env files when present (local). Render injects env vars directly.
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 dotenv.config({
   path: path.resolve(__dirname, "../../.env.local"),
@@ -20,6 +21,7 @@ dotenv.config({
 const PORT = Number(process.env.PORT || process.env.VOICE_SERVER_PORT || 8081);
 const HOST = process.env.VOICE_SERVER_HOST || "0.0.0.0";
 const startedAt = Date.now();
+const labEnabled = isVoiceLabEnabled();
 
 function healthPayload() {
   const geminiKey = Boolean(process.env.GEMINI_API_KEY?.trim());
@@ -49,6 +51,8 @@ function healthPayload() {
     twilioConfigured: twilioOk,
     appUrlConfigured: appUrl,
     environment: process.env.NODE_ENV || "development",
+    voiceLabEnabled: labEnabled,
+    voiceLabPath: labEnabled ? "/voice-lab" : null,
   };
 }
 
@@ -64,7 +68,8 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ ok: false, error: "not_found" }));
 });
 
-const wss = new WebSocketServer({ server, path: "/media-stream" });
+const wss = new WebSocketServer({ noServer: true });
+const labWss = new WebSocketServer({ noServer: true });
 let activeStreams = 0;
 
 wss.on("connection", (ws, req) => {
@@ -79,9 +84,37 @@ wss.on("connection", (ws, req) => {
   void handleTwilioMediaStream(ws);
 });
 
+labWss.on("connection", (ws, req) => {
+  console.info("[voice-lab] local microphone session connected", {
+    remote: req.socket.remoteAddress,
+    twilio: false,
+  });
+  void handleVoiceLabSocket(ws);
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const pathname = request.url?.split("?")[0] || "";
+  if (pathname === "/media-stream") {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+    return;
+  }
+  if (pathname === "/voice-lab" && labEnabled) {
+    labWss.handleUpgrade(request, socket, head, (ws) => {
+      labWss.emit("connection", ws, request);
+    });
+    return;
+  }
+  socket.destroy();
+});
+
 server.listen(PORT, HOST, () => {
   console.info(`[voice-server] listening on ${HOST}:${PORT}`);
   console.info(`[voice-server] media stream path: /media-stream`);
+  if (labEnabled) {
+    console.info(`[voice-lab] local path: ws://${HOST}:${PORT}/voice-lab (NO TWILIO)`);
+  }
   console.info(`[voice-server] health: http://${HOST}:${PORT}/health`);
   console.info(
     "[voice-server] set VOICE_STREAM_URL on the Next.js service to wss://<this-host>/media-stream"
@@ -91,6 +124,7 @@ server.listen(PORT, HOST, () => {
 async function shutdown() {
   console.info("[voice-server] shutting down", { activeStreams });
   wss.close();
+  labWss.close();
   server.close();
   await prisma.$disconnect().catch(() => undefined);
   process.exit(0);

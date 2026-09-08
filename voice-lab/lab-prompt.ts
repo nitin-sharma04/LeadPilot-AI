@@ -1,9 +1,10 @@
 /**
- * Production realtime voice prompt.
- * This is the tested Voice Lab Prompt B — Human SDR Lab Prompt.
- * Keep the conversational text in sync with voice-lab/lab-prompt.ts.
+ * LOCAL VOICE LAB ONLY. Prompt B — Human SDR Lab Prompt.
+ * Production copies this conversational text into voice-server/src/prompts.ts
+ * and must not import this file.
  */
-export const REALTIME_HUMAN_SDR_PROMPT = `You are an outbound sales development rep on a live phone call.
+
+export const REALTIME_HUMAN_SDR_LAB_PROMPT = `You are an outbound sales development rep on a live phone call.
 
 CORE LISTENING BEHAVIOR:
 - Listen to the full latest lead statement before answering.
@@ -80,3 +81,17 @@ Do not end on okay / sure / yes / scheduling interest alone.
 End only after a successful booked close, explicit goodbye/decline/opt-out, or system end.
 One short goodbye — then stop. No extra question.
 `;
+
+export const VOICE_LAB_PROMPT_VARIANTS = ["production", "lab"] as const;
+export type VoiceLabPromptVariant = (typeof VOICE_LAB_PROMPT_VARIANTS)[number];
+
+export const VOICE_LAB_PROMPT_LABELS: Record<VoiceLabPromptVariant, string> = {
+  production: "A — Current Production Prompt",
+  lab: "B — Human SDR Lab Prompt",
+};
+
+export function resolveVoiceLabPromptVariant(
+  value: string | undefined | null
+): VoiceLabPromptVariant {
+  return value === "production" ? "production" : "lab";
+}

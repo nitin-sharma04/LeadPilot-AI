@@ -56,6 +56,23 @@ export function mulawDecode(mulaw: Buffer): Int16Array {
   return out;
 }
 
+/** RMS of a µ-law frame (Twilio inbound). Used to ignore speaker-echo during AI playback. */
+export function mulawRms(mulaw: Buffer): number {
+  if (!mulaw.length) return 0;
+  const pcm = mulawDecode(mulaw);
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) {
+    const s = pcm[i];
+    sum += s * s;
+  }
+  return Math.sqrt(sum / pcm.length);
+}
+
+export function mulawBase64Rms(b64: string): number {
+  if (!b64) return 0;
+  return mulawRms(Buffer.from(b64, "base64"));
+}
+
 export function mulawEncode(pcm: Int16Array): Buffer {
   const out = Buffer.alloc(pcm.length);
   for (let i = 0; i < pcm.length; i++) {

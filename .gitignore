@@ -36,6 +36,10 @@ yarn-error.log*
 # Local Deepgram TTS experiment outputs (do not commit)
 /audio/
 
+# Temporary local voice lab session dumps
+/voice-lab/sessions/*.json
+
+
 # vercel
 .vercel
 
