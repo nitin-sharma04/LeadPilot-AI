@@ -47,6 +47,7 @@ export class GeminiLiveSession {
   private awaitingFreshAudio = false;
   /** After end-call: ignore inbound mic audio and block new non-closing prompts. */
   private acceptInput = true;
+  private openingSent = false;
   private readonly voice: GeminiLiveVoice;
   private readonly apiKey: string;
   private readonly model: string;
@@ -219,14 +220,14 @@ export class GeminiLiveSession {
     if (serverContent.inputTranscription?.text) {
       this.handlers.onInputTranscript?.(
         serverContent.inputTranscription.text,
-        { finished: Boolean(serverContent.inputTranscription.finished) }
+        { finished: serverContent.inputTranscription.finished }
       );
     }
 
     if (serverContent.outputTranscription?.text) {
       this.handlers.onOutputTranscript?.(
         serverContent.outputTranscription.text,
-        { finished: Boolean(serverContent.outputTranscription.finished) }
+        { finished: serverContent.outputTranscription.finished }
       );
     }
 
@@ -303,6 +304,8 @@ export class GeminiLiveSession {
    */
   requestOpening() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.openingSent) return;
+    this.openingSent = true;
     this.ws.send(
       JSON.stringify({
         clientContent: {

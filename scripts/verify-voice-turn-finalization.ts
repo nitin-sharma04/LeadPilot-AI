@@ -193,6 +193,114 @@ function applyLeadChunks(
   assert(handler.includes("beginEndFlow"), "T12 end flow");
 }
 
+// 13. Missing `finished` flag is treated as a complete utterance (this Live model)
+{
+  const tracker = new AppointmentIntentTracker();
+  const turns = new VoiceTurnController();
+  const { finals, noteLeadCalls } = applyLeadChunks(tracker, turns, [
+    { text: "Yeah, what's this about?" },
+  ]);
+  assert(finals.length === 1, "T13 undefined finished is final");
+  assert(noteLeadCalls.length === 1, "T13 noteLead once");
+  assert(isFinalizedLeadTranscript(undefined), "T13 undefined meta is final");
+  assert(isFinalizedLeadTranscript({}), "T13 empty meta is final");
+  assert(isFinalizedLeadTranscript({ finished: true }), "T13 true is final");
+  assert(!isFinalizedLeadTranscript({ finished: false }), "T13 false is partial");
+}
+
+// 14. Duplicate opening greeting is not spoken twice
+{
+  const turns = new VoiceTurnController();
+  assert(turns.requestOpening(), "T14 first opening accepted");
+  assert(!turns.requestOpening(), "T14 second opening ignored");
+  const greeting = "Hey Nitin, it's John from ABC. Got a quick minute?";
+  const first = turns.tryAcceptModelResponse("generation_complete", greeting);
+  assert(first.accepted, "T14 first greeting accepted");
+  turns.tryBeginTts();
+  turns.noteAgentSpoken(greeting);
+  turns.endTts();
+  const dup = turns.tryAcceptModelResponse("generation_complete", greeting);
+  assert(!dup.accepted, "T14 duplicate greeting rejected");
+  assert(
+    dup.reason === "response_already_accepted" || dup.reason === "duplicate_spoken_text",
+    `T14 reason ${dup.reason}`
+  );
+  const next = turns.finalizeLeadTurn("Yeah, what's this about?");
+  assert(next.accepted, "T14 user turn after greeting");
+  const echo = turns.tryAcceptModelResponse("generation_complete", greeting);
+  assert(!echo.accepted && echo.reason === "duplicate_spoken_text", "T14 greeting echo on new turn dropped");
+  const reply = turns.tryAcceptModelResponse(
+    "generation_complete",
+    "We help teams follow up on leads automatically."
+  );
+  assert(reply.accepted, "T14 real reply accepted");
+}
+
+// 15. Barge-in bumps epoch; stale response never plays
+{
+  const turns = new VoiceTurnController();
+  turns.finalizeLeadTurn("Hello.");
+  turns.tryAcceptModelResponse("generation_complete", "Here is a long explanation.");
+  const tts = turns.tryBeginTts();
+  const oldEpoch = tts.epoch;
+  const barge = turns.onBargeIn();
+  assert(barge.epoch === oldEpoch + 1, "T15 epoch bumped");
+  assert(!turns.isAudioEpochCurrent(oldEpoch), "T15 old epoch stale");
+  assert(turns.isAudioEpochCurrent(barge.epoch), "T15 new epoch current");
+}
+
+// 16. Duplicate finalized transcript does not update appointment twice
+{
+  const tracker = new AppointmentIntentTracker();
+  const turns = new VoiceTurnController();
+  applyLeadChunks(tracker, turns, [
+    { text: "I want to schedule a meeting.", finished: true },
+    { text: "I want to schedule a meeting.", finished: true },
+  ]);
+  assert(tracker.isFlowActive, "T16 flow active");
+  const firstStatus = tracker.appointmentStatus;
+  applyLeadChunks(tracker, turns, [
+    { text: "I want to schedule a meeting.", finished: true },
+  ]);
+  assert(tracker.appointmentStatus === firstStatus, "T16 duplicate transcript ignored");
+}
+
+// 17. 10-turn conversation remains single-flight
+{
+  const turns = new VoiceTurnController();
+  turns.requestOpening();
+  const g0 = turns.tryAcceptModelResponse(
+    "generation_complete",
+    "Hey Nitin, it's John from ABC. Got a quick minute?"
+  );
+  assert(g0.accepted, "T17 greeting");
+  turns.tryBeginTts();
+  turns.noteAgentSpoken("Hey Nitin, it's John from ABC. Got a quick minute?");
+  turns.endTts();
+  for (let i = 1; i <= 10; i++) {
+    const f = turns.finalizeLeadTurn(`User line number ${i} with some words.`);
+    assert(f.accepted, `T17 turn ${i} finalized`);
+    const r = turns.tryAcceptModelResponse(
+      "generation_complete",
+      `AI reply number ${i}, short and clear.`
+    );
+    assert(r.accepted, `T17 turn ${i} one response`);
+    const dup = turns.tryAcceptModelResponse("generation_complete", `AI reply number ${i}, short and clear.`);
+    assert(!dup.accepted, `T17 turn ${i} duplicate blocked`);
+    const t1 = turns.tryBeginTts();
+    const t2 = turns.tryBeginTts();
+    assert(t1.accepted && !t2.accepted, `T17 turn ${i} one TTS`);
+    turns.noteAgentSpoken(`AI reply number ${i}, short and clear.`);
+    turns.endTts();
+  }
+  assert(turns.currentLeadTurnId === 10, "T17 ten user turns");
+}
+
+const geminiSrc = readFileSync(
+  path.join(process.cwd(), "voice-server/src/gemini-live.ts"),
+  "utf8"
+);
+
 // Handler wiring: finished gate, no duplicate noteLead, one TTS path
 {
   assert(handler.includes("isFinalizedLeadTranscript(meta)"), "finished meta used");
@@ -210,11 +318,21 @@ function applyLeadChunks(
     !outputBlock.includes("prepareAndSpeakGeminiTurn"),
     "output transcript does not start TTS"
   );
-  assert(handler.includes('tryAcceptModelResponse("generation_complete")'), "TTS from generationComplete");
+  assert(handler.includes("generation_complete"), "TTS from generationComplete");
   assert(handler.includes("deepgramTurnInFlight"), "deepgram flight flag");
   assert(handler.includes("tts_duplicate_ignored") || handler.includes("tryBeginTts"), "TTS gate");
   assert(handler.includes("[voice-turn]"), "turn logs");
   assert(!/sleep\s*\(\s*\d+/.test(handler), "no response sleep");
+  assert(handler.includes("queueNote"), "coaching notes queued");
+  assert(handler.includes("flushNotesIfIdle"), "notes flushed when idle");
+  assert(handler.includes("turns.requestOpening()"), "opening gated");
+  assert(!/from ["'].*voice-lab/.test(handler), "production handler does not import voice-lab");
+  assert(geminiSrc.includes("openingSent"), "Gemini opening is idempotent");
+  assert(
+    geminiSrc.includes("{ finished: serverContent.inputTranscription.finished }"),
+    "finished flag is not coerced with Boolean()"
+  );
+  assert(!geminiSrc.includes("Boolean(serverContent.inputTranscription.finished)"), "no Boolean finished");
 }
 
 console.log("Voice turn finalization verification passed.");

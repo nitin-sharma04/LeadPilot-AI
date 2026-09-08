@@ -27,6 +27,7 @@ import {
   type SpeechPace,
 } from "./speech-pace.js";
 import { TranscriptFinalizer } from "./transcript-finalizer.js";
+import { isInternalTranscript } from "./transcript-cleanup.js";
 import { completeTwilioCall } from "./twilio-hangup.js";
 import {
   DeepgramTtsError,
@@ -98,6 +99,15 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   let agentSpokenThisTurn = false;
   let latency = emptyVoiceLatencyMarks();
   const turns = new VoiceTurnController();
+  /**
+   * [INTERNAL] coaching / booking / pace notes. Sending clientContent while Gemini is
+   * generating aborts that generation (surfaces as interrupted) and can stall the turn.
+   * Queue until the model is idle.
+   */
+  const pendingNotes: string[] = [];
+  // TODO(silence-reengagement): at most one gentle nudge after prolonged user silence,
+  // never while USER_SPEAKING or AI_SPEAKING, never looping. Do not add until it can
+  // be proven not to fight Gemini VAD.
 
   const logVoiceTurn = (input: {
     turnId: number;
@@ -111,7 +121,26 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       leadText: input.leadText,
       responseStarted: input.responseStarted,
       reason: input.reason,
+      epoch: turns.epoch,
     });
+  };
+
+  const geminiIdle = () =>
+    !turns.responseGenerationInFlight && !turns.ttsInFlight && !deepgramTurnInFlight;
+
+  const flushNotesIfIdle = () => {
+    if (!gemini || !pendingNotes.length || !geminiIdle()) return;
+    const note = pendingNotes.join(" ");
+    pendingNotes.length = 0;
+    gemini.notifySystem(note, { generate: false });
+  };
+
+  const queueNote = (text: string) => {
+    const compact = text.replace(/\s+/g, " ").trim();
+    if (!compact) return;
+    if (pendingNotes[pendingNotes.length - 1] === compact) return;
+    pendingNotes.push(compact);
+    flushNotesIfIdle();
   };
 
   const tryBookOnLeadConfirmation = async (leadText: string) => {
@@ -145,27 +174,24 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
           displayWhen: result.displayWhen || result.preferredText,
           timezone: result.timezone,
         });
-        gemini.notifySystem(
+        queueNote(
           `[INTERNAL] booking_ok when=${result.displayWhen || "agreed time"}${
             result.timezone ? ` tz=${result.timezone}` : ""
-          }. Already spoken. Do not repeat. Do not goodbye yet.`,
-          { generate: false }
+          }. Already spoken. Do not repeat. Do not goodbye yet.`
         );
         await speakAuthoritativeAgent(spoken);
       } else if (result.reason === "ambiguous_time") {
         apptTracker.resetBookingAttempt();
-        gemini.notifySystem(
-          "[INTERNAL] booking_fail=ambiguous_time. Ask one clock-time clarification. Do not claim invite sent.",
-          { generate: false }
+        queueNote(
+          "[INTERNAL] booking_fail=ambiguous_time. Ask one clock-time clarification. Do not claim invite sent."
         );
         await speakAuthoritativeAgent(
           "What clock time should I use? For example, five PM."
         );
       } else {
         apptTracker.markFailed();
-        gemini.notifySystem(
-          "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent.",
-          { generate: false }
+        queueNote(
+          "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent."
         );
         await speakAuthoritativeAgent(spokenBookingFailure());
       }
@@ -175,9 +201,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         callId,
         message: error instanceof Error ? error.message : "unknown",
       });
-      gemini.notifySystem(
-        "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent.",
-        { generate: false }
+      queueNote(
+        "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent."
       );
       await speakAuthoritativeAgent(spokenBookingFailure());
     }
@@ -360,6 +385,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       if (myEpoch === ttsEpoch) {
         deepgramTurnInFlight = false;
         turns.endTts();
+        flushNotesIfIdle();
       }
     }
   };
@@ -453,7 +479,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     if (detectsSlowSpeechRequest(leadText) && speechPace !== "slow") {
       speechPace = "slow";
       console.info("[voice-server] speechPace=slow", { callId });
-      gemini?.notifySystem(slowSpeechSystemNudge(), { generate: false });
+      queueNote(slowSpeechSystemNudge());
     }
 
     apptTracker.noteLead(leadText);
@@ -465,7 +491,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         const hint =
           apptTracker.coachingHint() ||
           "[INTERNAL] appt=continue. Meeting is not goodbye.";
-        gemini?.notifySystem(hint, { generate: false });
+        queueNote(hint);
         return;
       }
       const force = detectsForceHangupIntent(leadText);
@@ -481,7 +507,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       const hint = apptTracker.coachingHint();
       if (hint && hint !== lastCoachingHint) {
         lastCoachingHint = hint;
-        gemini?.notifySystem(hint, { generate: false });
+        queueNote(hint);
       }
     }
   };
@@ -690,7 +716,9 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 ttsProvider,
                 vadSilenceMs: getVadSilenceMs(),
               });
-              gemini?.requestOpening();
+              if (turns.requestOpening()) {
+                gemini?.requestOpening();
+              }
             },
             onAudioPcm24kBase64: (pcmB64, sampleRateHz) => {
               if (endController && !endController.shouldAcceptOutboundAudio) {
@@ -743,6 +771,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 callId,
                 ttsProvider,
                 cancelTts: barge.cancelTts,
+                epoch: barge.epoch,
               });
               clearOutboundAudio();
               finalizer?.discardAgentBuffer();
@@ -753,10 +782,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             },
             onInputTranscriptInterim: (text) => {
               if (endController?.isEnding) return;
+              if (isInternalTranscript(text)) return;
               finalizer?.setInterimLead(text);
             },
             onInputTranscript: (text, meta) => {
               if (endController?.isEnding) return;
+              if (isInternalTranscript(text)) return;
               finalizer?.appendLead(text);
               if (!isFinalizedLeadTranscript(meta)) return;
               processFinalLeadTurn(finalizer?.peekLead() || text);
@@ -768,7 +799,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
               void (async () => {
                 if (ttsProvider === "deepgram") {
                   if (endController?.isEnding && skipNextAgentSpeak) return;
-                  const gate = turns.tryAcceptModelResponse("generation_complete");
+                  const peeked = finalizer?.peekAgent() || null;
+                  if (!toSpeakableAgentText(peeked)) return;
+                  const gate = turns.tryAcceptModelResponse(
+                    "generation_complete",
+                    peeked
+                  );
                   logVoiceTurn({
                     turnId: gate.turnId,
                     leadText: turns.lastFinalizedLead,
@@ -776,7 +812,6 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                     reason: gate.reason,
                   });
                   if (!gate.accepted) return;
-                  const peeked = finalizer?.peekAgent() || null;
                   await prepareAndSpeakGeminiTurn(peeked);
                   return;
                 }
@@ -794,19 +829,21 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 if (endController?.isEnding) {
                   await finalizer?.flushLead();
                   if (ttsProvider === "deepgram") {
-                    const endingGate = turns.tryAcceptModelResponse(
-                      "turn_complete_ending"
-                    );
-                    if (endingGate.accepted) {
-                      logVoiceTurn({
-                        turnId: endingGate.turnId,
-                        leadText: turns.lastFinalizedLead,
-                        responseStarted: true,
-                        reason: endingGate.reason,
-                      });
-                      await prepareAndSpeakGeminiTurn(
-                        finalizer?.peekAgent() || null
+                    const peeked = finalizer?.peekAgent() || null;
+                    if (toSpeakableAgentText(peeked)) {
+                      const endingGate = turns.tryAcceptModelResponse(
+                        "turn_complete_ending",
+                        peeked
                       );
+                      if (endingGate.accepted) {
+                        logVoiceTurn({
+                          turnId: endingGate.turnId,
+                          leadText: turns.lastFinalizedLead,
+                          responseStarted: true,
+                          reason: endingGate.reason,
+                        });
+                        await prepareAndSpeakGeminiTurn(peeked);
+                      }
                     }
                   } else {
                     await finalizer?.flushAgent();
@@ -821,30 +858,34 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                 }
 
                 if (ttsProvider === "deepgram") {
-                  const fallback = turns.tryAcceptModelResponse(
-                    "turn_complete_fallback"
-                  );
-                  if (fallback.accepted) {
-                    logVoiceTurn({
-                      turnId: fallback.turnId,
-                      leadText: turns.lastFinalizedLead,
-                      responseStarted: true,
-                      reason: fallback.reason,
-                    });
-                    await prepareAndSpeakGeminiTurn(
-                      finalizer?.peekAgent() || null
+                  const peeked = finalizer?.peekAgent() || null;
+                  if (toSpeakableAgentText(peeked)) {
+                    const fallback = turns.tryAcceptModelResponse(
+                      "turn_complete_fallback",
+                      peeked
                     );
-                  } else {
-                    logVoiceTurn({
-                      turnId: fallback.turnId,
-                      leadText: turns.lastFinalizedLead,
-                      responseStarted: false,
-                      reason: fallback.reason,
-                    });
+                    if (fallback.accepted) {
+                      logVoiceTurn({
+                        turnId: fallback.turnId,
+                        leadText: turns.lastFinalizedLead,
+                        responseStarted: true,
+                        reason: fallback.reason,
+                      });
+                      await prepareAndSpeakGeminiTurn(peeked);
+                    } else {
+                      logVoiceTurn({
+                        turnId: fallback.turnId,
+                        leadText: turns.lastFinalizedLead,
+                        responseStarted: false,
+                        reason: fallback.reason,
+                      });
+                    }
                   }
                 } else {
                   await finalizer?.flushAgent();
                 }
+
+                flushNotesIfIdle();
 
                 const spoken = turns.lastFinalizedAgent;
                 if (
@@ -856,7 +897,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                     const hint =
                       apptTracker.coachingHint() ||
                       "[INTERNAL] appt=continue. Do not end. Collect date/time/confirm. No fake booking.";
-                    gemini?.notifySystem(hint, { generate: false });
+                    queueNote(hint);
                     return;
                   }
                   if (apptTracker.hasBooked && !leadSpokeAfterBooking) {

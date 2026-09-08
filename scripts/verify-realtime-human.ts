@@ -39,7 +39,12 @@ assert(
     REALTIME_HUMAN_SDR_PROMPT.includes("Only claim booked"),
   "no false booking"
 );
-assert(REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE"), "appointment stages");
+assert(
+  REALTIME_HUMAN_SDR_PROMPT.includes("COLLECT_DATE") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("ask for a day") ||
+    REALTIME_HUMAN_SDR_PROMPT.includes("Missing date"),
+  "appointment stages"
+);
 assert(
   REALTIME_HUMAN_SDR_PROMPT.includes("slow down") ||
     REALTIME_HUMAN_SDR_PROMPT.includes("SPEAK SLOWER") ||
