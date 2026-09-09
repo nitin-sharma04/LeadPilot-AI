@@ -81,6 +81,13 @@ export class AppointmentIntentTracker {
   noteLead(text: string) {
     const cleaned = text.replace(/\s+/g, " ").trim();
     if (!cleaned || cleaned === "[unclear]") return;
+    if (
+      /[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF\u3040-\u30FF\u4E00-\u9FFF]/.test(
+        cleaned
+      )
+    ) {
+      return;
+    }
     if (this.leadLines[this.leadLines.length - 1] === cleaned) {
       this.lastPreferred = this.buildPreferredPhrase();
       return;
@@ -233,19 +240,17 @@ export class AppointmentIntentTracker {
   }
 
   private buildPreferredPhrase(): string {
-    const dayHints: string[] = [];
-    const timeHints: string[] = [];
-    const tzHints: string[] = [];
+    let day = "";
+    let time = "";
+    let tz = "";
     for (const line of this.leadLines) {
-      if (DAY_RE.test(line)) dayHints.push(line);
-      if (CLOCK_RE.test(line)) timeHints.push(line);
-      if (TZ_RE.test(line)) tzHints.push(line);
+      const dayM = line.match(DAY_RE);
+      const timeM = line.match(CLOCK_RE);
+      const tzM = line.match(TZ_RE);
+      if (dayM) day = dayM[0];
+      if (timeM) time = timeM[0];
+      if (tzM) tz = tzM[0];
     }
-    const parts = [
-      dayHints[dayHints.length - 1] || "",
-      timeHints[timeHints.length - 1] || "",
-      tzHints[tzHints.length - 1] || "",
-    ].filter(Boolean);
-    return parts.join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
+    return [day, time, tz].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
   }
 }

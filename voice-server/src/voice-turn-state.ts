@@ -5,9 +5,11 @@
  * → POST_SPEECH_GUARD → LISTENING
  *
  * One finalized lead turn → one generation id → one TTS → one playback.
- * Stale Gemini events (generationComplete / turnComplete / leftover text)
- * must never speak after a newer user turn or barge-in.
+ * Completion events never authorize a new response. Only finalizeLeadTurn
+ * (or the opening/closing exceptions) may call beginGeneration.
  */
+
+import { isNearDuplicateAgentSpeech } from "./transcript-sanity.js";
 
 export type VoiceTurnPhase =
   | "idle"
@@ -188,6 +190,10 @@ export class VoiceTurnController {
   ttsAcceptedForTurn: number | null = null;
   lastFinalizedLead: string | null = null;
   lastFinalizedAgent: string | null = null;
+  lastSpokenAgentTurns: string[] = [];
+  /** Set only by finalizeLeadTurn / opening / closing. Completion events cannot set this. */
+  authorizedUserTurnId: number | null = null;
+  geminiInterruptSeq = 0;
   /** Bumped on barge-in / stale invalidate. Stale TTS must not play. */
   epoch = 0;
   openingRequested = false;
@@ -230,6 +236,7 @@ export class VoiceTurnController {
     this.ttsAcceptedForTurn = null;
     this.ttsInFlight = false;
     this.ignoreModelOutputUntilLead = false;
+    this.authorizedUserTurnId = this.currentLeadTurnId;
     this.responseAbort = new AbortController();
     this.ttsAbort = new AbortController();
     this.aggregator = new ResponseAggregator(this.generationId, this.currentLeadTurnId);
@@ -307,6 +314,9 @@ export class VoiceTurnController {
     if (this.ignoreModelOutputUntilLead) {
       return { accepted: false, reason: "stale_output_before_lead" };
     }
+    if (this.authorizedUserTurnId === null) {
+      return { accepted: false, reason: "no_authorized_user_turn" };
+    }
     if (!this.awaitingResponse) {
       return { accepted: false, reason: "not_awaiting_response" };
     }
@@ -355,11 +365,14 @@ export class VoiceTurnController {
     const turnId = this.currentLeadTurnId;
     const spoken = (agentText || this.aggregator?.text || "").replace(/\s+/g, " ").trim();
 
-    if (
-      observedGenerationId != null &&
-      observedGenerationId !== this.generationId
-    ) {
+    if (observedGenerationId != null && observedGenerationId !== this.generationId) {
       return this.reject("stale_generation");
+    }
+    if (this.authorizedUserTurnId === null) {
+      return this.reject("no_authorized_user_turn");
+    }
+    if (this.authorizedUserTurnId !== this.currentLeadTurnId) {
+      return this.reject("stale_user_turn");
     }
     if (!this.awaitingResponse) {
       return this.reject("not_awaiting_response");
@@ -382,7 +395,7 @@ export class VoiceTurnController {
     if (this.responseGenerationInFlight) {
       return this.reject("response_in_flight");
     }
-    if (this.isEchoOfLastSpoken(spoken)) {
+    if (this.isNearDuplicateSpoken(spoken)) {
       return this.reject("duplicate_spoken_text");
     }
     if (spoken) {
@@ -423,12 +436,25 @@ export class VoiceTurnController {
   }
 
   isEchoOfLastSpoken(text: string): boolean {
+    return this.isNearDuplicateSpoken(text);
+  }
+
+  isNearDuplicateSpoken(text: string): boolean {
     const clean = text.replace(/\s+/g, " ").trim();
-    if (!clean || !this.lastFinalizedAgent) return false;
-    return normalizeSpoken(clean) === normalizeSpoken(this.lastFinalizedAgent);
+    if (!clean) return false;
+    if (isNearDuplicateAgentSpeech(this.lastFinalizedAgent, clean)) return true;
+    return this.lastSpokenAgentTurns.some((prev) =>
+      isNearDuplicateAgentSpeech(prev, clean)
+    );
   }
 
   tryBeginTts(turnId: number = this.currentLeadTurnId): VoiceTurnAcceptResult {
+    if (this.authorizedUserTurnId === null) {
+      return this.reject("no_authorized_user_turn");
+    }
+    if (this.authorizedUserTurnId !== turnId) {
+      return this.reject("stale_user_turn");
+    }
     if (this.ttsInFlight) {
       const same = this.ttsAcceptedForTurn === turnId;
       return this.reject(same ? "tts_duplicate_same_turn" : "tts_in_flight");
@@ -517,6 +543,7 @@ export class VoiceTurnController {
     this.acceptedGenerationId = this.generationId;
     this.spokenGenerationId = this.generationId;
     this.awaitingResponse = false;
+    this.authorizedUserTurnId = this.currentLeadTurnId;
     this.aggregator = new ResponseAggregator(this.generationId, this.currentLeadTurnId);
     this.aggregator.status = "finalized";
     return this.tryBeginTts(this.currentLeadTurnId);
@@ -539,6 +566,7 @@ export class VoiceTurnController {
     this.aggregator = new ResponseAggregator(this.generationId, this.currentLeadTurnId);
     this.responseAcceptedForTurn = this.currentLeadTurnId;
     this.leadTurnFinalized = false;
+    this.authorizedUserTurnId = null;
     this.ignoreModelOutputUntilLead = true;
     this.phase = "user_speaking";
     return { cancelTts, epoch: this.epoch, generationId: this.generationId };
@@ -552,8 +580,44 @@ export class VoiceTurnController {
     return generationId === this.generationId;
   }
 
+  /**
+   * Gemini fired `interrupted`. Always advance interrupt identity so local
+   * generation tracking cannot go stale. Echo/tiny interrupts must NOT cancel
+   * TTS and must NOT authorize a new response.
+   */
+  syncEchoInterrupt(): {
+    cancelAudio: false;
+    generationId: number;
+    interruptSeq: number;
+  } {
+    this.geminiInterruptSeq += 1;
+    if (
+      this.spokenGenerationId === this.generationId ||
+      this.acceptedGenerationId === this.generationId ||
+      this.ttsInFlight ||
+      this.aiSpeaking
+    ) {
+      this.awaitingResponse = false;
+      this.ignoreModelOutputUntilLead = true;
+    } else if (this.awaitingResponse) {
+      this.outputSeenForGeneration = false;
+      this.aggregator = new ResponseAggregator(
+        this.generationId,
+        this.currentLeadTurnId
+      );
+    }
+    return {
+      cancelAudio: false,
+      generationId: this.generationId,
+      interruptSeq: this.geminiInterruptSeq,
+    };
+  }
+
   noteAgentSpoken(text: string) {
-    this.lastFinalizedAgent = text.replace(/\s+/g, " ").trim();
+    const clean = text.replace(/\s+/g, " ").trim();
+    this.lastFinalizedAgent = clean;
+    if (!clean) return;
+    this.lastSpokenAgentTurns = [...this.lastSpokenAgentTurns, clean].slice(-2);
   }
 
   private reject(reason: string): VoiceTurnAcceptResult {

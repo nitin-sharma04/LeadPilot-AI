@@ -54,6 +54,10 @@ import {
   LeadUtteranceAssembler,
   VoiceTurnController,
 } from "./voice-turn-state.js";
+import {
+  evaluateLeadTranscript,
+  isValidShortHumanTurn,
+} from "./transcript-sanity.js";
 
 type TwilioEvent = {
   event?: string;
@@ -108,6 +112,8 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   let playbackMarkName: string | null = null;
   let inboundLoudMs = 0;
   let lastPlaybackGenerationId: number | null = null;
+  let lastAiFinishedAt = 0;
+  let lastInboundSpeechAt = 0;
   /**
    * [INTERNAL] coaching / booking / pace notes. Sending clientContent while Gemini is
    * generating aborts that generation (surfaces as interrupted) and can stall the turn.
@@ -201,6 +207,19 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     clearPlaybackWatchdog();
     const guardMs = getPostSpeechGuardMs();
     turns.markPlaybackComplete(Date.now(), guardMs, generationId);
+    lastAiFinishedAt = Date.now();
+    if (inboundLoudMs < getBargeInMinSpeechMs()) {
+      leadAssembler.clear();
+      clearInputFinalizeTimer();
+      finalizer?.discardLeadBuffer();
+    }
+    console.info("[tts]", {
+      callId,
+      userTurnId: turns.currentLeadTurnId,
+      generationId,
+      completed: true,
+      durationMs: Date.now() - (latency.twilioFirstAudioAt || lastAiFinishedAt),
+    });
     console.info("[voice-playback]", {
       callId,
       generationId,
@@ -258,9 +277,11 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     });
     console.info("[barge-in]", {
       callId,
-      oldGenerationId,
-      newTurnId: turns.currentLeadTurnId,
+      detected: true,
+      userTurnId: turns.currentLeadTurnId,
       generationId: barge.generationId,
+      inboundLoudMs,
+      cancelled: true,
     });
     console.info("[generation]", {
       callId,
@@ -288,6 +309,31 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     return barge;
   };
 
+  const silenceSinceAiMs = (now: number) => {
+    if (turns.isAiSpeaking) return 0;
+    if (lastAiFinishedAt <= 0) return 0;
+    return Math.max(0, now - lastAiFinishedAt);
+  };
+
+  const authorizeFinalLead = (text: string, now: number): boolean => {
+    const decision = evaluateLeadTranscript({
+      text,
+      silenceMs: silenceSinceAiMs(now),
+      inboundLoudMs,
+    });
+    if (!decision.accept) {
+      console.info("[transcript]", {
+        callId,
+        rejectedGarbage: true,
+        text: text.slice(0, 160),
+        reason: decision.reason,
+        silenceMs: silenceSinceAiMs(now),
+      });
+      return false;
+    }
+    return true;
+  };
+
   const scheduleLeadDebounce = () => {
     clearInputFinalizeTimer();
     const wait = getInputFinalizeDebounceMs();
@@ -297,9 +343,15 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       turns.enterListeningIfGuardElapsed(now);
       if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) return;
       if (!leadAssembler.shouldDebounceFinalize(now, wait)) return;
-      const text = leadAssembler.take();
+      const text = leadAssembler.peek();
       if (!text) return;
-      processFinalLeadTurn(text);
+      if (!authorizeFinalLead(text, now)) {
+        leadAssembler.clear();
+        return;
+      }
+      const taken = leadAssembler.take();
+      if (!taken) return;
+      processFinalLeadTurn(taken);
     }, wait);
   };
 
@@ -316,14 +368,21 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     finalizer?.appendLead(text);
 
     const peeked = leadAssembler.peek();
-    const words = peeked.split(/\s+/).filter(Boolean).length;
     const minSpeech = getBargeInMinSpeechMs();
+    const shortHuman = isValidShortHumanTurn(peeked);
 
     if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) {
       const substantial =
-        words >= 2 || inboundLoudMs >= minSpeech || isFinalizedLeadTranscript(meta);
+        shortHuman ||
+        inboundLoudMs >= minSpeech ||
+        (isFinalizedLeadTranscript(meta) &&
+          peeked.length > 0 &&
+          authorizeFinalLead(peeked, now));
       if (!substantial) {
-        if (isFinalizedLeadTranscript(meta) && words < 1) return;
+        if (turns.isInPostSpeechGuard(now)) {
+          scheduleLeadDebounce();
+          return;
+        }
         scheduleLeadDebounce();
         return;
       }
@@ -334,6 +393,11 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
 
     if (isFinalizedLeadTranscript(meta)) {
       clearInputFinalizeTimer();
+      const candidate = leadAssembler.peek();
+      if (!candidate || !authorizeFinalLead(candidate, now)) {
+        leadAssembler.clear();
+        return;
+      }
       const finalText = leadAssembler.take();
       if (finalText) processFinalLeadTurn(finalText);
       return;
@@ -345,15 +409,17 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     }
   };
 
-  const tryBookOnLeadConfirmation = async (leadText: string) => {
+  const tryBookOnLeadConfirmation = async (leadText: string, userTurnId: number) => {
     if (!callId || !streamToken || !gemini) return;
     if (!apptTracker.shouldAttemptBooking(leadText)) return;
 
     apptTracker.markBookingAttempted();
-    // Stop any premature "invite sent" audio already generating.
-    clearOutboundAudio();
-    finalizer?.discardAgentBuffer();
-    skipNextAgentSpeak = true;
+    console.info("[appointment]", {
+      callId,
+      analysisQueued: true,
+      userTurnId,
+    });
+    const analysisStarted = Date.now();
 
     try {
       const result = await bookAppointmentFromVoiceCall({
@@ -362,6 +428,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         preferredTimeText: apptTracker.preferredText,
         explicitConfirmation: true,
       });
+      console.info("[appointment]", {
+        callId,
+        analysisCompleted: true,
+        durationMs: Date.now() - analysisStarted,
+        userTurnId,
+      });
       console.info("[voice-server] mid-call book result", {
         callId,
         booked: result.booked,
@@ -369,6 +441,9 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         reason: result.reason ?? null,
         appointmentId: result.appointmentId ?? null,
       });
+      if (turns.currentLeadTurnId !== userTurnId) {
+        return;
+      }
       if (result.booked) {
         apptTracker.markBooked();
         leadSpokeAfterBooking = false;
@@ -381,21 +456,28 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
             result.timezone ? ` tz=${result.timezone}` : ""
           }. Already spoken. Do not repeat. Do not goodbye yet.`
         );
+        if (!agentSpokenThisTurn) skipNextAgentSpeak = true;
         await speakAuthoritativeAgent(spoken);
       } else if (result.reason === "ambiguous_time") {
         apptTracker.resetBookingAttempt();
         queueNote(
           "[INTERNAL] booking_fail=ambiguous_time. Ask one clock-time clarification. Do not claim invite sent."
         );
-        await speakAuthoritativeAgent(
-          "What clock time should I use? For example, five PM."
-        );
+        if (!agentSpokenThisTurn) {
+          skipNextAgentSpeak = true;
+          await speakAuthoritativeAgent(
+            "What clock time should I use? For example, five PM."
+          );
+        }
       } else {
         apptTracker.markFailed();
         queueNote(
           "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent."
         );
-        await speakAuthoritativeAgent(spokenBookingFailure());
+        if (!agentSpokenThisTurn) {
+          skipNextAgentSpeak = true;
+          await speakAuthoritativeAgent(spokenBookingFailure());
+        }
       }
     } catch (error) {
       apptTracker.markFailed();
@@ -403,10 +485,20 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
         callId,
         message: error instanceof Error ? error.message : "unknown",
       });
+      console.info("[appointment]", {
+        callId,
+        analysisCompleted: true,
+        durationMs: Date.now() - analysisStarted,
+        userTurnId,
+      });
       queueNote(
         "[INTERNAL] booking_fail. Say booking did not complete; offer another time. Do not claim invite sent."
       );
-      await speakAuthoritativeAgent(spokenBookingFailure());
+      if (turns.currentLeadTurnId !== userTurnId) return;
+      if (!agentSpokenThisTurn) {
+        skipNextAgentSpeak = true;
+        await speakAuthoritativeAgent(spokenBookingFailure());
+      }
     }
   };
 
@@ -482,7 +574,16 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
   ): Promise<boolean> => {
     const speakable = toSpeakableAgentText(agentText);
     if (!speakable) return false;
-    if (shouldSkipDuplicateSynthesis(lastDeepgramSpoken, speakable)) return false;
+    if (shouldSkipDuplicateSynthesis(lastDeepgramSpoken, speakable)) {
+      console.info("[voice-turn]", {
+        callId,
+        duplicateSuppressed: true,
+        similarity: 1,
+        currentText: speakable.slice(0, 120),
+        previousTurnId: turns.currentLeadTurnId,
+      });
+      return false;
+    }
     if (isLikelyUnsupportedForFluxEnglish(speakable)) {
       console.warn("[deepgram-tts] skipped unsupported language (Flux is English-only)", {
         callId,
@@ -753,15 +854,27 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     });
     console.info("[voice-turn]", {
       callId,
-      turnId: finalized.turnId,
+      userTurnStarted: true,
+      userTurnId: finalized.turnId,
+      generationId: finalized.generationId,
+    });
+    console.info("[voice-turn]", {
+      callId,
+      userTurnFinalized: true,
+      userTurnId: finalized.turnId,
+      text: turns.lastFinalizedLead,
+      durationMs: 0,
       generationId: finalized.generationId,
       inputFinalized: turns.lastFinalizedLead,
     });
     console.info("[generation]", {
       callId,
-      generationId: finalized.generationId,
       started: true,
-      turnId: finalized.turnId,
+      userTurnId: finalized.turnId,
+      generationId: finalized.generationId,
+      geminiGenerationStarted: true,
+      localGenerationId: finalized.generationId,
+      state: turns.phase,
     });
     console.info("[input]", {
       callId,
@@ -776,7 +889,7 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
     }
 
     apptTracker.noteLead(leadText);
-    void tryBookOnLeadConfirmation(leadText);
+    void tryBookOnLeadConfirmation(leadText, finalized.turnId);
     void finalizer?.flushLead();
 
     if (detectsEndCallIntent(leadText)) {
@@ -1079,33 +1192,36 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
               const now = Date.now();
               turns.enterListeningIfGuardElapsed(now);
               const peeked = leadAssembler.peek();
-              const words = peeked.split(/\s+/).filter(Boolean).length;
               const minSpeech = getBargeInMinSpeechMs();
+              const shortHuman = isValidShortHumanTurn(peeked);
+              const confidentSpeech =
+                shortHuman || inboundLoudMs >= minSpeech;
               if (
-                turns.isInPostSpeechGuard(now) &&
-                words < 2 &&
-                inboundLoudMs < minSpeech
+                (turns.isInPostSpeechGuard(now) || turns.isAiSpeaking) &&
+                !confidentSpeech
               ) {
+                const sync = turns.syncEchoInterrupt();
                 console.info("[voice-stale]", {
                   callId,
-                  generationId: turns.generationId,
-                  action: "ignore_echo_interrupt",
+                  generationId: sync.generationId,
+                  interruptSeq: sync.interruptSeq,
+                  action: turns.isInPostSpeechGuard(now)
+                    ? "ignore_echo_interrupt"
+                    : "ignore_tiny_interrupt",
                 });
-                return;
-              }
-              if (
-                turns.isAiSpeaking &&
-                words < 1 &&
-                inboundLoudMs < minSpeech
-              ) {
-                console.info("[voice-stale]", {
+                console.info("[generation]", {
                   callId,
-                  generationId: turns.generationId,
-                  action: "ignore_tiny_interrupt",
+                  generationId: sync.generationId,
+                  geminiGenerationStarted: true,
+                  localGenerationId: turns.generationId,
+                  userTurnId: turns.authorizedUserTurnId,
+                  state: turns.phase,
+                  reason: "echo_interrupt_synced",
                 });
                 return;
               }
               if (!turns.isAiSpeaking && !turns.isInPostSpeechGuard(now)) {
+                turns.syncEchoInterrupt();
                 turns.noteLeadActivity();
                 return;
               }
@@ -1173,6 +1289,23 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                     generationId: gate.generationId,
                   });
                   if (!gate.accepted) {
+                    console.info("[generation]", {
+                      callId,
+                      generationRejected: true,
+                      reason: gate.reason,
+                      userTurnId: gate.turnId,
+                      generationId: gate.generationId,
+                    });
+                    if (gate.reason === "duplicate_spoken_text") {
+                      console.info("[voice-turn]", {
+                        callId,
+                        duplicateSuppressed: true,
+                        similarity: 0.8,
+                        currentText: (peeked || "").slice(0, 120),
+                        previousTurnId: gate.turnId,
+                        generationId: gate.generationId,
+                      });
+                    }
                     if (gate.reason !== "response_already_accepted") {
                       console.info("[voice-stale]", {
                         callId,
@@ -1183,6 +1316,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                     }
                     return;
                   }
+                  console.info("[generation]", {
+                    callId,
+                    generationAccepted: true,
+                    userTurnId: gate.turnId,
+                    generationId: gate.generationId,
+                  });
                   console.info("[voice-turn]", {
                     callId,
                     turnId: gate.turnId,
@@ -1264,6 +1403,12 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                         generationId
                       );
                       if (fallback.accepted) {
+                        console.info("[generation]", {
+                          callId,
+                          generationAccepted: true,
+                          userTurnId: fallback.turnId,
+                          generationId: fallback.generationId,
+                        });
                         logVoiceTurn({
                           turnId: fallback.turnId,
                           leadText: turns.lastFinalizedLead,
@@ -1272,6 +1417,13 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
                         });
                         await prepareAndSpeakGeminiTurn(peeked);
                       } else {
+                        console.info("[generation]", {
+                          callId,
+                          generationRejected: true,
+                          reason: fallback.reason,
+                          userTurnId: fallback.turnId,
+                          generationId: fallback.generationId,
+                        });
                         logVoiceTurn({
                           turnId: fallback.turnId,
                           leadText: turns.lastFinalizedLead,
@@ -1335,15 +1487,19 @@ export async function handleTwilioMediaStream(twilioWs: WebSocket) {
       const now = Date.now();
       turns.enterListeningIfGuardElapsed(now);
       try {
+        const rms = mulawBase64Rms(payload);
+        if (rms >= getEchoRmsThreshold()) {
+          inboundLoudMs += 20;
+          lastInboundSpeechAt = now;
+        } else {
+          inboundLoudMs = Math.max(0, inboundLoudMs - 20);
+        }
         if (turns.isAiSpeaking || turns.isInPostSpeechGuard(now)) {
-          const rms = mulawBase64Rms(payload);
           if (rms < getEchoRmsThreshold()) {
-            inboundLoudMs = Math.max(0, inboundLoudMs - 20);
             return;
           }
-          inboundLoudMs += 20;
-        } else {
-          inboundLoudMs = 0;
+        } else if (now - lastInboundSpeechAt > 400) {
+          inboundLoudMs = Math.max(0, inboundLoudMs - 40);
         }
         const pcm16k = mulaw8kToPcm16kBase64(payload);
         gemini.sendPcm16kBase64(pcm16k);

@@ -78,39 +78,53 @@ export function getVadSilenceMs(
 /**
  * After AI audio has actually played, ignore false "user silence / echo"
  * turn completions. This is a guard, not a timer that generates speech.
- * Default 1200ms. Clamp 400–3000.
+ * Default 650ms. Clamp 400–3000.
  */
 export function getPostSpeechGuardMs(
   value: string | undefined = process.env.VOICE_POST_SPEECH_GUARD_MS
 ): number {
-  const raw = Number.parseInt(value || "1200", 10);
-  if (!Number.isFinite(raw)) return 1200;
+  const raw = Number.parseInt(value || "650", 10);
+  if (!Number.isFinite(raw)) return 650;
   return Math.min(3000, Math.max(400, raw));
 }
 
 /**
  * Ignore tiny noise/echo bursts as barge-in during AI playback.
- * Default 280ms. Clamp 80–800. Short "yes"/"no" still pass if loud enough.
+ * Default 170ms. Clamp 80–800. Short "yes"/"wait"/"no" still pass.
  */
 export function getBargeInMinSpeechMs(
   value: string | undefined = process.env.VOICE_BARGE_IN_MIN_SPEECH_MS
 ): number {
-  const raw = Number.parseInt(value || "280", 10);
-  if (!Number.isFinite(raw)) return 280;
+  const raw = Number.parseInt(value || "170", 10);
+  if (!Number.isFinite(raw)) return 170;
   return Math.min(800, Math.max(80, raw));
 }
 
 /**
  * When Gemini omits inputTranscription.finished, wait this long after the
  * last input chunk before treating the utterance as complete.
- * Default 500ms. Clamp 200–1200.
+ * Default 350ms. Clamp 200–1200.
+ * VOICE_INPUT_FINALIZE_DEBOUNCE_MS preferred; VOICE_INPUT_FINALIZE_MS still works.
  */
 export function getInputFinalizeDebounceMs(
-  value: string | undefined = process.env.VOICE_INPUT_FINALIZE_MS
+  value: string | undefined =
+    process.env.VOICE_INPUT_FINALIZE_DEBOUNCE_MS ||
+    process.env.VOICE_INPUT_FINALIZE_MS
 ): number {
-  const raw = Number.parseInt(value || "500", 10);
-  if (!Number.isFinite(raw)) return 500;
+  const raw = Number.parseInt(value || "350", 10);
+  if (!Number.isFinite(raw)) return 350;
   return Math.min(1200, Math.max(200, raw));
+}
+
+/**
+ * Optional holding utterance while Gemini Live is slow.
+ * Default false — never used as a generation trigger.
+ */
+export function isVoiceFillerEnabled(
+  value: string | undefined = process.env.VOICE_ENABLE_FILLER
+): boolean {
+  const v = (value || "false").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
 }
 
 /** Phone-safe end-of-speech: LOW waits through short pauses. */

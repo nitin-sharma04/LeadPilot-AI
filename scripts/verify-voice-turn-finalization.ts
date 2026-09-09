@@ -11,9 +11,21 @@ import {
 } from "../voice-server/src/end-call-intent";
 import { mergeStreamingTranscript } from "../voice-server/src/transcript-cleanup";
 import {
+  evaluateLeadTranscript,
+  isNearDuplicateAgentSpeech,
+  isValidShortHumanTurn,
+} from "../voice-server/src/transcript-sanity";
+import { buildPreferredPhraseFromTranscript } from "../src/lib/calendar/appointment-intent";
+import {
   isFinalizedLeadTranscript,
   VoiceTurnController,
 } from "../voice-server/src/voice-turn-state";
+import {
+  getBargeInMinSpeechMs,
+  getInputFinalizeDebounceMs,
+  getPostSpeechGuardMs,
+  isVoiceFillerEnabled,
+} from "../voice-server/src/config";
 
 function assert(c: boolean, m: string) {
   if (!c) throw new Error(`FAIL: ${m}`);
@@ -334,6 +346,212 @@ const geminiSrc = readFileSync(
     "finished flag is not coerced with Boolean()"
   );
   assert(!geminiSrc.includes("Boolean(serverContent.inputTranscription.finished)"), "no Boolean finished");
+  assert(handler.includes("evaluateLeadTranscript") || handler.includes("authorizeFinalLead"), "garbage filter wired");
+  assert(handler.includes("syncEchoInterrupt"), "echo interrupt syncs generation identity");
+  assert(handler.includes("void tryBookOnLeadConfirmation"), "appointment does not block the turn");
+  assert(!handler.includes("Mm, one sec"), "no filler utterance in production path");
+  const processLead = handler.slice(
+    handler.indexOf("const processFinalLeadTurn"),
+    handler.indexOf("const teardownMedia")
+  );
+  assert(!processLead.includes("await tryBookOnLeadConfirmation"), "booking is not awaited on the live turn");
+}
+
+const deepgramSrc = readFileSync(
+  path.join(process.cwd(), "voice-server/src/tts/deepgram-tts.ts"),
+  "utf8"
+);
+assert(deepgramSrc.includes("stale_rest_fallback"), "N cancelled REST fallback discarded");
+assert(deepgramSrc.includes("stale_or_cancelled_before_rest"), "N cancelled before REST");
+
+assert(getPostSpeechGuardMs("650") === 650, "guard default target");
+assert(getBargeInMinSpeechMs("170") === 170, "barge-in min 170");
+assert(getInputFinalizeDebounceMs("350") === 350, "debounce 350");
+assert(!isVoiceFillerEnabled("false"), "filler off");
+assert(!isVoiceFillerEnabled(""), "filler default off");
+
+// A. AI finishes → 2 seconds silence → NO second AI response
+{
+  const turns = new VoiceTurnController();
+  turns.requestOpening();
+  turns.acceptLiveResponse("Hey, got a minute?");
+  turns.tryBeginTts();
+  turns.noteAgentSpoken("Hey, got a minute?");
+  const t0 = Date.now();
+  turns.markPlaybackComplete(t0, 650);
+  turns.enterListeningIfGuardElapsed(t0 + 2000);
+  const extra = turns.tryAcceptModelResponse(
+    "generation_complete",
+    "Hey, got a minute?"
+  );
+  assert(!extra.accepted, "A no second response after silence");
+  assert(
+    extra.reason === "not_awaiting_response" ||
+      extra.reason === "duplicate_spoken_text" ||
+      extra.reason === "ignoreModelOutputUntilLead" ||
+      extra.reason === "stale_output_before_lead" ||
+      extra.reason === "stale_or_no_output",
+    `A reason ${extra.reason}`
+  );
+  const garbage = evaluateLeadTranscript({
+    text: "Movie Film Talk",
+    silenceMs: 2000,
+    inboundLoudMs: 0,
+  });
+  assert(!garbage.accept, "A garbage after pause is not a user turn");
+}
+
+// B. AI finishes → user says yeah after 1.5s → ONE AI response
+{
+  const turns = new VoiceTurnController();
+  turns.requestOpening();
+  turns.acceptLiveResponse("Hey, got a minute?");
+  turns.tryBeginTts();
+  turns.noteAgentSpoken("Hey, got a minute?");
+  turns.endTts();
+  turns.markPlaybackComplete(Date.now(), 650);
+  const decision = evaluateLeadTranscript({
+    text: "Yeah, that makes sense.",
+    silenceMs: 1500,
+    inboundLoudMs: 180,
+  });
+  assert(decision.accept, "B yeah after pause is a user turn");
+  const f = turns.finalizeLeadTurn("Yeah, that makes sense.");
+  assert(f.accepted, "B finalize");
+  const r1 = turns.acceptLiveResponse("Great — we help with follow-up.");
+  const r2 = turns.tryAcceptModelResponse("turn_complete_fallback");
+  assert(r1.accepted && !r2.accepted, "B exactly one response");
+}
+
+// C. AI speaking → user says wait → AI stops → ONE new response
+{
+  const turns = new VoiceTurnController();
+  turns.finalizeLeadTurn("Tell me about pricing.");
+  turns.acceptLiveResponse("Pricing depends on several long factors.");
+  turns.tryBeginTts();
+  assert(isValidShortHumanTurn("wait"), "C wait is a valid barge-in");
+  const barge = turns.onBargeIn();
+  assert(barge.cancelTts, "C cancel TTS");
+  const next = turns.finalizeLeadTurn("Wait, what about pricing?");
+  assert(next.accepted, "C new turn");
+  const fresh = turns.acceptLiveResponse("Pricing starts at two thousand.");
+  const dup = turns.tryAcceptModelResponse("generation_complete");
+  assert(fresh.accepted && !dup.accepted, "C one new response");
+}
+
+// D. tiny echo interrupt does not cancel TTS; generation identity stays synced
+{
+  const turns = new VoiceTurnController();
+  turns.finalizeLeadTurn("Hello.");
+  turns.acceptLiveResponse("Hey — got a minute?");
+  turns.tryBeginTts();
+  const gen = turns.generationId;
+  const sync = turns.syncEchoInterrupt();
+  assert(sync.cancelAudio === false, "D does not cancel audio");
+  assert(sync.generationId === gen, "D local generation id stays");
+  assert(turns.ttsInFlight, "D TTS still in flight");
+  const leftover = turns.tryAcceptModelResponse(
+    "generation_complete",
+    "Unsolicited continuation."
+  );
+  assert(!leftover.accepted, "D unsolicited output discarded");
+}
+
+// E. One user turn → multiple Gemini completion events → ONE TTS only
+{
+  const turns = new VoiceTurnController();
+  turns.finalizeLeadTurn("I just want more clients.");
+  const first = turns.acceptLiveResponse("What are you hoping to improve?");
+  const second = turns.tryAcceptModelResponse("generation_complete");
+  const third = turns.tryAcceptModelResponse("turn_complete_fallback");
+  assert(first.accepted && !second.accepted && !third.accepted, "E one accept");
+  const tts1 = turns.tryBeginTts();
+  const tts2 = turns.tryBeginTts();
+  assert(tts1.accepted && !tts2.accepted, "E one TTS");
+}
+
+// F. Duplicate Gemini text → TTS suppressed
+{
+  const turns = new VoiceTurnController();
+  turns.finalizeLeadTurn("Go on.");
+  const spoken = "We help teams follow up automatically.";
+  turns.acceptLiveResponse(spoken);
+  turns.tryBeginTts();
+  turns.noteAgentSpoken(spoken);
+  turns.endTts();
+  turns.finalizeLeadTurn("Okay.");
+  const echo = turns.acceptLiveResponse(spoken);
+  assert(!echo.accepted, "F duplicate suppressed");
+  assert(echo.reason === "duplicate_spoken_text", `F reason ${echo.reason}`);
+}
+
+// G. Appointment analysis running slowly does not block realtime (wiring)
+{
+  assert(handler.includes("void tryBookOnLeadConfirmation"), "G async book");
+  const processLead = handler.slice(
+    handler.indexOf("const processFinalLeadTurn"),
+    handler.indexOf("const teardownMedia")
+  );
+  assert(!processLead.includes("await tryBookOnLeadConfirmation"), "G not awaited");
+  assert(!processLead.includes("generateContent"), "G no REST generateContent on turn");
+}
+
+// H. Appointment analyzer receives only finalized user text / extracted hints
+{
+  const phrase = buildPreferredPhraseFromTranscript([
+    { speaker: "LEAD", text: "No, we can talk." },
+    { speaker: "LEAD", text: "Movie Film Talk" },
+    { speaker: "LEAD", text: "Yes, ma'am." },
+    { speaker: "LEAD", text: "영감님, 기운을" },
+  ]);
+  assert(phrase === "", "H garbage lines are not merged into preferred time");
+  const tracker = new AppointmentIntentTracker();
+  tracker.noteLead("No, we can talk.");
+  tracker.noteLead("Movie Film Talk");
+  tracker.noteLead("영감님, 기운을");
+  assert(tracker.preferredText === "", "H tracker ignores garbage preferred phrase");
+}
+
+// I. Garbage transcript after silence → no hallucinated response
+{
+  const g = evaluateLeadTranscript({
+    text: "영감님, 기운을",
+    silenceMs: 3500,
+    inboundLoudMs: 0,
+  });
+  assert(!g.accept && g.reason === "rejectedGarbage", "I hangul garbage rejected");
+}
+
+// J / K. yes / no remain valid turns
+{
+  assert(evaluateLeadTranscript({ text: "yes", silenceMs: 1500, inboundLoudMs: 0 }).accept, "J yes");
+  assert(evaluateLeadTranscript({ text: "no", silenceMs: 1500, inboundLoudMs: 0 }).accept, "K no");
+  assert(isValidShortHumanTurn("yeah"), "J yeah");
+  assert(isValidShortHumanTurn("wait"), "C wait short");
+}
+
+// L. Two legitimate turns with overlapping common words are not duplicate-suppressed
+{
+  assert(
+    !isNearDuplicateAgentSpeech(
+      "We can help you get more clients.",
+      "Tuesday at four works on our side."
+    ),
+    "L different replies"
+  );
+}
+
+// M. Stale generation output discarded
+{
+  const turns = new VoiceTurnController();
+  turns.finalizeLeadTurn("Hello.");
+  const firstGen = turns.generationId;
+  turns.acceptLiveResponse("Hey there.");
+  turns.tryBeginTts();
+  turns.onBargeIn();
+  turns.finalizeLeadTurn("I just want more clients.");
+  const stale = turns.tryAcceptModelResponse("generation_complete", "Hey there.", firstGen);
+  assert(!stale.accepted, "M stale generation discarded");
 }
 
 console.log("Voice turn finalization verification passed.");

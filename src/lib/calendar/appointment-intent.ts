@@ -65,13 +65,19 @@ export function buildPreferredPhraseFromTranscript(
   for (const line of leadLines) {
     const lower = line.toLowerCase();
     if (/\b(today|tomorrow)\b/i.test(line) || /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(line)) {
-      dayHints.push(line);
+      const day = line.match(
+        /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i
+      );
+      if (day) dayHints.push(day[0]);
     }
-    if (/\b\d{1,2}(?::\d{2})?\s*(a\.?m\.?|p\.?m\.?)?\b/i.test(line)) {
-      timeHints.push(line);
+    const clock = line.match(/\b\d{1,2}(?::\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b/i);
+    if (clock) {
+      timeHints.push(clock[0]);
     }
     if (TIMEZONE_ALIASES.some((a) => a.re.test(line))) {
-      tzHints.push(line);
+      const alias = TIMEZONE_ALIASES.find((a) => a.re.test(line));
+      const token = alias ? line.match(alias.re)?.[0] : null;
+      if (token) tzHints.push(token);
     }
     // Ignore pure "afternoon" without a clock — only attach if we already have a time
     if (
@@ -102,8 +108,7 @@ export function buildPreferredPhraseFromTranscript(
     parts.push(p);
   }
   if (parts.length === 0) {
-    // Fall back to last few lead lines joined
-    return leadLines.slice(-4).join(" ").slice(0, 240);
+    return "";
   }
   return parts.join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
 }

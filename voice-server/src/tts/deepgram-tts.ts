@@ -212,7 +212,13 @@ export class DeepgramTtsSession {
           this.liveReady = null;
         }
       }
-      if (this.cancelled || this.requestSeq !== requestId || signal?.aborted) return;
+      if (this.cancelled || this.requestSeq !== requestId || signal?.aborted) {
+        console.info("[tts]", {
+          discarded: true,
+          reason: "stale_or_cancelled_before_rest",
+        });
+        return;
+      }
       yield* this.synthesizeViaRest(text);
     } finally {
       signal?.removeEventListener("abort", onAbort);
@@ -320,12 +326,16 @@ export class DeepgramTtsSession {
     };
     this.lastTiming = timing;
     if (this.cancelled) {
+      console.info("[tts]", {
+        discarded: true,
+        reason: "stale_rest_fallback",
+      });
       return;
     }
+    const restId = this.requestSeq;
 
     let result;
     this.restAbort = new AbortController();
-    const restId = this.requestSeq;
     try {
       result = await this.client.speak.v2.audio.generate(
         {
@@ -344,9 +354,24 @@ export class DeepgramTtsSession {
         }
       );
     } catch (error) {
+      if (this.cancelled || this.requestSeq !== restId) {
+        console.info("[tts]", {
+          discarded: true,
+          reason: "stale_rest_fallback",
+        });
+        return;
+      }
       throw new DeepgramTtsError(
         error instanceof Error ? error.message : "deepgram generate failed"
       );
+    }
+
+    if (this.cancelled || this.requestSeq !== restId) {
+      console.info("[tts]", {
+        discarded: true,
+        reason: "stale_rest_fallback",
+      });
+      return;
     }
 
     const webStream = result.stream();
