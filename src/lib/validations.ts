@@ -20,8 +20,18 @@ export const signupSchema = z.object({
 
 export const createLeadSchema = z.object({
   name: z.string().min(2, "Name is required"),
-  email: z.string().email("Enter a valid email"),
-  phone: z.string().optional(),
+  email: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .email("Enter a valid email"),
+  phone: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = value?.trim();
+      return trimmed ? trimmed : undefined;
+    }),
   companyName: z.string().min(1, "Company is required"),
   jobTitle: z.string().optional(),
   industry: z.string().optional(),

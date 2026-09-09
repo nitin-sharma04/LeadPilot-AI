@@ -12,12 +12,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useState } from "react";
+import Link from "next/link";
+import type { AddLeadResult } from "@/lib/lead-create-client";
 import type { Lead, LeadSource } from "@/types";
 
 interface AddLeadModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onAdd: (lead: Lead) => void | Promise<void>;
+  onAdd: (lead: Lead) => Promise<AddLeadResult>;
 }
 
 export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
@@ -29,6 +31,8 @@ export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
   const [dealValue, setDealValue] = useState("5000");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [existingLeadId, setExistingLeadId] = useState<string | null>(null);
 
   function reset() {
     setName("");
@@ -38,21 +42,26 @@ export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
     setSource("Website");
     setDealValue("5000");
     setMessage("");
+    setFormError(null);
+    setExistingLeadId(null);
   }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (saving) return;
     if (!name.trim() || !company.trim() || !email.trim()) return;
 
     setSaving(true);
+    setFormError(null);
+    setExistingLeadId(null);
     try {
-      const value = Number(dealValue) || 0;
+      const value = Math.trunc(Math.max(0, Number(dealValue) || 0));
       const lead: Lead = {
         id: "temp",
         name: name.trim(),
         company: company.trim(),
         email: email.trim(),
-        phone: phone.trim() || "",
+        phone: phone.trim(),
         industry: "General",
         source,
         score: 50,
@@ -68,16 +77,35 @@ export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
         estimatedBudget: "To be determined",
         recommendedAction: "Qualify this lead and schedule a first touch.",
       };
-      await onAdd(lead);
+      const result = await onAdd(lead);
+      if (!result.ok) {
+        setFormError(result.error);
+        setExistingLeadId(result.existingLeadId ?? null);
+        return;
+      }
       reset();
       onOpenChange(false);
+    } catch (error) {
+      setFormError(
+        error instanceof Error ? error.message : "Unable to create lead"
+      );
     } finally {
       setSaving(false);
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (saving && !next) return;
+        if (!next) {
+          setFormError(null);
+          setExistingLeadId(null);
+        }
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Add Lead</DialogTitle>
@@ -93,6 +121,7 @@ export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
                 id="lead-name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
+                minLength={2}
                 required
               />
             </div>
@@ -146,6 +175,7 @@ export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
                 id="lead-value"
                 type="number"
                 min={0}
+                step={1}
                 value={dealValue}
                 onChange={(e) => setDealValue(e.target.value)}
               />
@@ -161,8 +191,29 @@ export function AddLeadModal({ open, onOpenChange, onAdd }: AddLeadModalProps) {
               placeholder="What is the lead looking for?"
             />
           </div>
+          {formError ? (
+            <p className="text-sm text-destructive" role="alert">
+              {formError}
+              {existingLeadId ? (
+                <>
+                  {" "}
+                  <Link
+                    href={`/dashboard/leads/${existingLeadId}`}
+                    className="font-medium underline underline-offset-2"
+                  >
+                    Open existing lead
+                  </Link>
+                </>
+              ) : null}
+            </p>
+          ) : null}
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={saving}
+              onClick={() => onOpenChange(false)}
+            >
               Cancel
             </Button>
             <Button type="submit" disabled={saving}>

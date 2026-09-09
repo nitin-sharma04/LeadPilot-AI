@@ -3,7 +3,7 @@ import { LeadSource, LeadStatus } from "@prisma/client";
 import { requireSession } from "@/lib/session";
 import { createLeadSchema } from "@/lib/validations";
 import { createLead, listLeads } from "@/services/leads";
-import { jsonError } from "@/lib/errors";
+import { jsonError, logUnexpectedApiError } from "@/lib/errors";
 
 export async function GET(request: NextRequest) {
   try {
@@ -47,8 +47,15 @@ export async function POST(request: NextRequest) {
     }
 
     const lead = await createLead(user, parsed.data);
+    if (!lead?.id) {
+      return Response.json(
+        { error: "Lead was not created. Please try again." },
+        { status: 500 }
+      );
+    }
     return Response.json({ data: lead }, { status: 201 });
   } catch (error) {
-    return jsonError(error, "Unable to create lead", 500);
+    logUnexpectedApiError("POST /api/leads", error);
+    return jsonError(error, "Unable to create lead");
   }
 }

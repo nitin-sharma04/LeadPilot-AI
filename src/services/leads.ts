@@ -6,7 +6,7 @@
 import { LeadSource, LeadStatus, Prisma } from "@prisma/client";
 import { createHash } from "crypto";
 import { prisma } from "@/lib/prisma";
-import { AppError } from "@/lib/errors";
+import { AppError, DuplicateLeadError } from "@/lib/errors";
 import { mapLeadToUi } from "@/lib/mappers";
 import type { CreateLeadInput, UpdateLeadInput } from "@/lib/validations";
 import type { SessionUser } from "@/lib/session";
@@ -38,6 +38,11 @@ export type CreateLeadRecordInput = {
   activityDescription?: string;
   /** Skip duplicate-by-email and return existing */
   dedupeByEmail?: boolean;
+  /**
+   * Dashboard manual create: throw DuplicateLeadError (HTTP 409) instead of
+   * returning the existing record. Capture/CSV/CRM keep silent dedupe.
+   */
+  rejectDuplicates?: boolean;
   external?: {
     provider: "HUBSPOT" | "SALESFORCE" | "DEMO";
     externalId: string;
@@ -47,19 +52,30 @@ export type CreateLeadRecordInput = {
   runAutomation?: boolean;
 };
 
-function normalizeEmail(email: string) {
+export function normalizeLeadEmail(email: string) {
   return email.trim().toLowerCase();
 }
 
-function normalizePhone(phone?: string | null) {
+export function normalizeLeadPhone(phone?: string | null) {
   if (!phone) return null;
   const digits = phone.replace(/[^\d+]/g, "").trim();
   return digits || null;
 }
 
+/** Dashboard create throws 409; capture/CSV/CRM return the existing record. */
+export function maybeRejectDuplicateLead(
+  rejectDuplicates: boolean | undefined,
+  existingLeadId: string,
+  field: "email" | "phone"
+) {
+  if (rejectDuplicates) {
+    throw new DuplicateLeadError(existingLeadId, field);
+  }
+}
+
 export async function createLeadRecord(input: CreateLeadRecordInput) {
-  const email = normalizeEmail(input.email);
-  const phone = normalizePhone(input.phone);
+  const email = normalizeLeadEmail(input.email);
+  const phone = normalizeLeadPhone(input.phone);
   const source = input.source ?? LeadSource.MANUAL;
 
   if (input.external) {
@@ -89,6 +105,7 @@ export async function createLeadRecord(input: CreateLeadRecordInput) {
       include: { analysis: true },
     });
     if (existing) {
+      maybeRejectDuplicateLead(input.rejectDuplicates, existing.id, "email");
       await prisma.activity.create({
         data: {
           companyId: input.companyId,
@@ -113,6 +130,7 @@ export async function createLeadRecord(input: CreateLeadRecordInput) {
       include: { analysis: true },
     });
     if (byPhone) {
+      maybeRejectDuplicateLead(input.rejectDuplicates, byPhone.id, "phone");
       await prisma.activity.create({
         data: {
           companyId: input.companyId,
@@ -330,15 +348,15 @@ export async function createLead(user: SessionUser, input: CreateLeadInput) {
     actorName: user.name,
     activityType: "LEAD_CREATED",
     dedupeByEmail: true,
+    rejectDuplicates: true,
     runAutomation: true,
   });
 
   if (result.duplicate) {
-    return {
-      ...mapLeadToUi(result.lead),
-      duplicate: true,
-      reason: result.reason,
-    };
+    throw new DuplicateLeadError(
+      result.lead.id,
+      result.reason === "phone" ? "phone" : "email"
+    );
   }
 
   // Allow optional score overrides from manual form only after create

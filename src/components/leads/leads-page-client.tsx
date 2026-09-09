@@ -2,8 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { MoreHorizontal, Plus, Search, Download, Users, Upload } from "lucide-react";
 import { toast } from "sonner";
+import {
+  buildDashboardLeadCreateBody,
+  interpretLeadCreateResponse,
+  mergeCreatedLeadIntoList,
+  type AddLeadResult,
+} from "@/lib/lead-create-client";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { ScoreBadge, StatusBadge } from "@/components/leads/badges";
@@ -64,6 +71,7 @@ type LeadsPageClientProps = {
 };
 
 export function LeadsPageClient({ initialLeads, team }: LeadsPageClientProps) {
+  const router = useRouter();
   const [leads, setLeads] = useState<Lead[]>(initialLeads);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<"all" | LeadStatus>("all");
@@ -114,27 +122,49 @@ export function LeadsPageClient({ initialLeads, team }: LeadsPageClientProps) {
     source: LeadSource;
     dealValue: number;
     message: string;
-  }) {
-    const res = await fetch("/api/leads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: payload.name,
-        companyName: payload.company,
-        email: payload.email,
-        phone: payload.phone,
-        source: mapSourceToDb(payload.source),
-        dealValue: payload.dealValue,
-        message: payload.message,
-      }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      toast.error(json.error || "Unable to create lead");
-      return;
+  }): Promise<AddLeadResult> {
+    let res: Response;
+    let json: unknown = {};
+    try {
+      res = await fetch("/api/leads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildDashboardLeadCreateBody(payload)),
+      });
+      json = await res.json().catch(() => ({}));
+    } catch {
+      const failure: AddLeadResult = {
+        ok: false,
+        status: 0,
+        error: "Unable to create lead",
+      };
+      toast.error(failure.error);
+      return failure;
     }
-    setLeads((prev) => [json.data, ...prev]);
+
+    const result = interpretLeadCreateResponse({
+      ok: res.ok,
+      status: res.status,
+      json,
+    });
+
+    if (!result.ok) {
+      if (result.existingLeadId) {
+        toast.error(result.error, {
+          action: {
+            label: "Open lead",
+            onClick: () => router.push(`/dashboard/leads/${result.existingLeadId}`),
+          },
+        });
+      } else {
+        toast.error(result.error);
+      }
+      return result;
+    }
+
+    setLeads((prev) => mergeCreatedLeadIntoList(prev, result.lead));
     toast.success("Lead saved to your workspace.");
+    return result;
   }
 
   async function handleDelete(id: string) {
@@ -371,8 +401,8 @@ export function LeadsPageClient({ initialLeads, team }: LeadsPageClientProps) {
       <AddLeadModal
         open={addOpen}
         onOpenChange={setAddOpen}
-        onAdd={async (lead) => {
-          await handleAdd({
+        onAdd={(lead) =>
+          handleAdd({
             name: lead.name,
             company: lead.company,
             email: lead.email,
@@ -380,8 +410,8 @@ export function LeadsPageClient({ initialLeads, team }: LeadsPageClientProps) {
             source: lead.source,
             dealValue: lead.dealValue,
             message: lead.message,
-          });
-        }}
+          })
+        }
       />
     </div>
   );
